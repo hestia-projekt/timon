@@ -180,38 +180,139 @@ fork_health() {
   return 1
 }
 
-# Same bytes as the fingerprint stored at backup time (sqlite3, then sha256).
+# Put one database back, or remove one the fork created.
+#
+# saved is the schema fingerprint from backup time, or the word absent when
+# that file did not exist. absent is the only fingerprint that skips the
+# copy. A file created afterwards is removed, with its -wal and -shm: there
+# is no saved schema to compare, and the official daemon would otherwise
+# open a database it did not have. Writes in that new file are discarded.
+#
+# Any other fingerprint puts the saved copy back when the live file is
+# missing or its schema differs. The copy is checked first (mode 0600,
+# PRAGMA integrity_check, same fingerprint). Leftover -wal and -shm are
+# removed after that check and before the copy becomes the live file, so
+# SQLite cannot replay them onto the restored database. A matching schema
+# leaves the live file and its -wal/-shm in place.
 fork_maybe_restore_db() {
   dest=$1
   name=$2
   saved=$3
-  [ "$saved" = "absent" ] && return 0
+  case "$name" in
+    timon.db|integrations.db) ;;
+    *)
+      printf 'fork-build: refusing database name %s\n' "$name" >&2
+      return 1
+      ;;
+  esac
   live="$(fork_home)/$name"
-  [ -f "$live" ] || return 0
-  current=$(fork_schema_fingerprint "$live")
-  if [ "$current" = "$saved" ]; then
-    printf '%s schema unchanged\n' "$name"
+  wal="${live}-wal"
+  shm="${live}-shm"
+
+  # A directory (or anything else) must not receive the copy: mv into a
+  # directory would nest the database instead of replacing the path.
+  if [ -e "$live" ] && [ ! -f "$live" ]; then
+    printf 'fork-build: %s is not a regular file\n' "$name" >&2
+    return 1
+  fi
+
+  if [ "$saved" = "absent" ]; then
+    if [ -e "$live" ] || [ -L "$live" ] || [ -e "$wal" ] || [ -L "$wal" ] || [ -e "$shm" ] || [ -L "$shm" ]; then
+      rm -f -- "$live" "$wal" "$shm" || {
+        printf 'fork-build: could not remove %s created after the backup\n' "$name" >&2
+        return 1
+      }
+      printf '%s removed (absent at backup)\n' "$name"
+    else
+      printf '%s absent\n' "$name"
+    fi
     return 0
   fi
-  rm -f -- "${live}-wal" "${live}-shm"
-  cp -a -- "$dest/db/$name" "$live" || {
+
+  # Opening the live file here lets SQLite checkpoint its own WAL into it.
+  # That keeps post-switch writes when the schema matches. It does not
+  # replace the file with the backup.
+  if [ -f "$live" ]; then
+    current=$(fork_schema_fingerprint "$live") || current=
+    if [ -n "$current" ] && [ "$current" = "$saved" ]; then
+      printf '%s schema unchanged\n' "$name"
+      return 0
+    fi
+  fi
+
+  backup="$dest/db/$name"
+  if [ ! -f "$backup" ]; then
+    printf 'fork-build: backup of %s is missing\n' "$name" >&2
+    return 1
+  fi
+
+  # Check the copy before it replaces the live path. A failed check leaves
+  # the previous file where it is, including when that file is already gone.
+  tmp=$(mktemp "$(fork_home)/.restore-${name}.XXXXXX") || {
     printf 'fork-build: could not restore %s\n' "$name" >&2
     return 1
   }
-  check=$(sqlite3 "$live" "PRAGMA integrity_check;") || {
+  if ! cp -a -- "$backup" "$tmp"; then
+    rm -f -- "$tmp"
+    printf 'fork-build: could not restore %s\n' "$name" >&2
+    return 1
+  fi
+  if ! chmod 0600 "$tmp"; then
+    rm -f -- "$tmp"
+    printf 'fork-build: could not restrict restored %s\n' "$name" >&2
+    return 1
+  fi
+  mode=$(stat -c %a -- "$tmp") || mode=
+  if [ "$mode" != "600" ]; then
+    rm -f -- "$tmp"
+    printf 'fork-build: restored %s is mode %s, expected 600\n' "$name" "$mode" >&2
+    return 1
+  fi
+  check=$(sqlite3 "$tmp" "PRAGMA integrity_check;") || check=
+  if [ "$check" != "ok" ]; then
+    rm -f -- "$tmp"
     printf 'fork-build: restored %s failed integrity_check\n' "$name" >&2
     return 1
-  }
-  if [ "$check" != "ok" ]; then
-    printf 'fork-build: restored %s failed integrity_check\n' "$name" >&2
+  fi
+  restored_fp=$(fork_schema_fingerprint "$tmp") || restored_fp=
+  if [ "$restored_fp" != "$saved" ]; then
+    rm -f -- "$tmp"
+    printf 'fork-build: restored %s schema does not match the backup\n' "$name" >&2
+    return 1
+  fi
+  # The journal has to be gone before the new bytes take the live name.
+  if ! rm -f -- "$wal" "$shm"; then
+    rm -f -- "$tmp"
+    printf 'fork-build: could not remove leftover wal or shm for %s\n' "$name" >&2
+    return 1
+  fi
+  if ! mv -f -- "$tmp" "$live"; then
+    rm -f -- "$tmp"
+    printf 'fork-build: could not restore %s\n' "$name" >&2
     return 1
   fi
   printf '%s restored\n' "$name"
 }
 
+# Read the two fingerprints from the backup manifest and restore each one.
+# The second database is left untouched when the first restore fails.
+fork_restore_databases() {
+  dest=$1
+  timon_fp=$(jq -r '.databases["timon.db"].fingerprint' "$dest/manifest.json") || {
+    printf 'fork-build: cannot read %s\n' "$dest/manifest.json" >&2
+    return 1
+  }
+  integrations_fp=$(jq -r '.databases["integrations.db"].fingerprint' "$dest/manifest.json") || {
+    printf 'fork-build: cannot read %s\n' "$dest/manifest.json" >&2
+    return 1
+  }
+  fork_maybe_restore_db "$dest" timon.db "$timon_fp" || return 1
+  fork_maybe_restore_db "$dest" integrations.db "$integrations_fp" || return 1
+}
+
 # Stop the service, put the saved unit and pointer back, put the official
-# release tree back when its runner is gone, restore a database whose schema
-# changed, then start again and wait for health.
+# release tree back when its runner is gone, put the databases back, then
+# start again and wait for health.
 # Returns 1 on failure and does not exit the shell, except the "recheck"
 # argument: that path exits before the stop when a mission is running.
 # install.sh calls this from `if`, where dash ignores set -e, so each step
@@ -323,16 +424,7 @@ fork_restore_backup() {
     printf 'fork-build: daemon-reload failed\n' >&2
     return 1
   }
-  timon_fp=$(jq -r '.databases["timon.db"].fingerprint' "$dest/manifest.json") || {
-    printf 'fork-build: cannot read %s\n' "$dest/manifest.json" >&2
-    return 1
-  }
-  integrations_fp=$(jq -r '.databases["integrations.db"].fingerprint' "$dest/manifest.json") || {
-    printf 'fork-build: cannot read %s\n' "$dest/manifest.json" >&2
-    return 1
-  }
-  fork_maybe_restore_db "$dest" timon.db "$timon_fp" || return 1
-  fork_maybe_restore_db "$dest" integrations.db "$integrations_fp" || return 1
+  fork_restore_databases "$dest" || return 1
   systemctl --user start "$unit" || {
     printf 'fork-build: could not start %s\n' "$unit" >&2
     return 1

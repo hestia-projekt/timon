@@ -6,8 +6,10 @@
 #   ops/fork-build/install.sh --package DIR            # plan
 #   ops/fork-build/install.sh --package DIR --apply    # switch
 #
-# On a failed health check the previous unit is put back and a database
-# whose schema changed is restored from the backup this run just took.
+# On a failed health check the previous unit is put back. A database that
+# is missing or whose schema changed is restored from the backup this run
+# just took. A database that did not exist then is removed if this run
+# created it.
 # See ops/fork-build/README.md.
 set -eu
 

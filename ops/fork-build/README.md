@@ -100,12 +100,16 @@ Avec `--apply` : si le démon répond, le script refuse tant qu'une mission tour
 2. Remise du fichier d'unité et du pointeur `active-release` sauvegardés.
 3. Lecture de `activeRelease` dans `manifest.json`. Si `desktop-runtime/releases/<activeRelease>/resources/orchestrator/dist/host/packaged-runner.js` est absent, copie de `official-release` vers ce répertoire (un répertoire incomplet est retiré avant, pour que la copie porte le nom de la release), puis vérification du SHA-256 de `release-manifest.json`.
 4. Rechargement de systemd (`daemon-reload`).
-5. Restauration de `timon.db` ou `integrations.db` seulement si l'empreinte du schéma diffère de celle de la sauvegarde.
+5. Restauration de `timon.db`, puis de `integrations.db`. Une base n'est ignorée que si son empreinte sauvegardée vaut `absent` : le fichier n'existait pas avant la bascule.
+   - Empreinte `absent` : la copie n'est pas remise. Un fichier apparu depuis (la release qui a échoué l'a créé), ainsi que ses `-wal` et `-shm`, est supprimé, y compris quand il ne reste que le journal. Il n'existe pas de schéma sauvegardé auquel le comparer ; le démon officiel retrouve l'absence d'avant et recrée le fichier s'il en a besoin. Les écritures faites dans ce fichier après la bascule sont perdues.
+   - Fichier vivant absent, empreinte enregistrée : la copie sauvegardée est installée. Elle est en `0600`, `PRAGMA integrity_check` doit répondre `ok`, et l'empreinte du schéma doit être celle de la sauvegarde. Ces contrôles portent sur la copie, avant qu'elle prenne le nom du fichier vivant. Les `-wal` et `-shm` résiduels sont retirés après ces contrôles et avant ce remplacement, pour que SQLite ne les rejoue pas sur la copie.
+   - Fichier vivant présent, même empreinte : il reste en place, avec ses `-wal` et `-shm`. Les écritures faites après la bascule sont gardées.
+   - Fichier vivant présent, empreinte différente : la copie sauvegardée le remplace, aux mêmes conditions (`0600`, `integrity_check`, empreinte, journal retiré avant le remplacement). Les écritures faites après la bascule sont perdues.
 6. Redémarrage de l'unité et attente de `/api/health`.
 
-En cas d'échec, `fork_restore_backup` rend la main au lieu de quitter le shell. `install.sh` relance alors l'unité. `rollback.sh` s'arrête sur la même erreur.
+En cas d'échec, `fork_restore_backup` rend la main au lieu de quitter le shell. `install.sh` relance alors l'unité. `rollback.sh` s'arrête sur la même erreur. La seconde base n'est pas touchée si la première restauration a échoué.
 
-Remettre la base remplace aussi les écritures faites après la bascule. Si le schéma n'a pas bougé, la base en service est laissée telle quelle.
+`ops/fork-build/restore-db.test.sh` rejoue ces cas dans un répertoire temporaire (`TIMON_HOME` et `TIMON_FORK_DATA_HOME`). Il n'écrit pas dans `~/.timon` et n'appelle pas systemd.
 
 ## Recaler le fork sur une release amont
 

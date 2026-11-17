@@ -1,6 +1,8 @@
 #!/bin/sh
 # Point the service back at the official release saved by install.sh.
-# A database is restored only when its schema differs from that backup.
+# A saved database is restored when the live file is missing or its schema
+# differs. A database that did not exist at backup time is removed if the
+# fork created it. See fork_maybe_restore_db in lib.sh.
 # Without --apply it prints the plan and does not restart anything.
 #
 #   ops/fork-build/rollback.sh --backup DIR
