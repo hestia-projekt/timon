@@ -19,8 +19,8 @@
  */
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { cpSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
-import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path';
+import { cpSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
 const USAGE = `Usage: node ops/fork-build/assemble-release.mjs --checkout DIR --stage DIR --output DIR --shell DIR --key-dir DIR --version-id ID --commit SHA --modules DIR`;
@@ -42,29 +42,165 @@ function args(argv) {
   return out;
 }
 
-function real(path) {
-  return resolve(path);
+/** True when `child` is `parent` or a directory inside it. */
+function isInside(parent, child) {
+  const rel = relative(parent, child);
+  if (rel === '') return true;
+  if (isAbsolute(rel)) return false;
+  return rel !== '..' && !rel.startsWith(`..${sep}`);
+}
+
+/**
+ * Physical path. `realpath` is applied to the nearest existing ancestor
+ * (so a symlink there is followed) and the missing tail is appended.
+ * Nothing is created.
+ */
+function physicalPath(input) {
+  const absolute = resolve(input);
+  let cursor = absolute;
+  const missing = [];
+  while (true) {
+    try {
+      lstatSync(cursor);
+      break;
+    } catch (error) {
+      if (error.code !== 'ENOENT') throw new Error(`cannot resolve ${absolute}: ${error.message}`);
+      const parent = dirname(cursor);
+      if (parent === cursor) throw new Error(`cannot resolve ${absolute}`);
+      missing.push(basename(cursor));
+      cursor = parent;
+    }
+  }
+  let base;
+  try {
+    base = realpathSync(cursor);
+  } catch (error) {
+    throw new Error(`cannot resolve ${absolute}: ${error.message}`);
+  }
+  return missing.length === 0 ? base : join(base, ...missing.reverse());
+}
+
+/**
+ * A symlink ancestor must not leave the directory that contains it.
+ * That directory is the preparation root for a stage or output path.
+ */
+function assertNoEscapingSymlink(input, physical) {
+  const absolute = resolve(input);
+  const parts = absolute.split('/').filter(Boolean);
+  let current = '/';
+  for (let i = 0; i < parts.length; i++) {
+    const next = join(current, parts[i]);
+    let st;
+    try {
+      st = lstatSync(next);
+    } catch (error) {
+      if (error.code === 'ENOENT') return;
+      throw new Error(`cannot resolve ${absolute}: ${error.message}`);
+    }
+    if (st.isSymbolicLink()) {
+      const anchor = current === '/' ? '/' : physicalPath(current);
+      if (!isInside(anchor, physical) || physical === anchor) {
+        throw new Error(`${absolute} leaves ${anchor} through symlink ${next}`);
+      }
+      return;
+    }
+    current = next;
+  }
+}
+
+function liveHome() {
+  const env = process.env.HOME;
+  if (!env) throw new Error('HOME is not set');
+  return physicalPath(join(env, '.timon'));
 }
 
 /** A path must not sit inside the live home: the daemon executes that tree. */
 function assertOutside(path, home, what) {
-  const child = real(path);
-  const parent = real(home);
-  const rel = relative(parent, child);
-  if (rel === '' || (!rel.startsWith('..') && !isAbsolute(rel))) {
-    throw new Error(`${what} is inside ${parent}: refusing to build where the daemon runs`);
+  if (isInside(home, path)) {
+    throw new Error(`${what} is inside ${home}: refusing to build where the daemon runs`);
   }
 }
 
-// The stage is scratch this build creates. Only <somewhere>/stage/<version>
-// may be removed, and never a symlink (that would be a caller-chosen path).
-function assertRemovableStage(stagePath, versionId) {
-  if (versionId === '.' || versionId === '..' || basename(stagePath) !== versionId || basename(dirname(stagePath)) !== 'stage') {
+function assertStageIdentity(stagePath, versionId) {
+  if (versionId === '.' || versionId === '..' || !/^[0-9A-Za-z._-]{1,80}$/.test(versionId)) {
+    throw new Error(`refusing version id ${versionId}`);
+  }
+  if (basename(stagePath) !== versionId || basename(dirname(stagePath)) !== 'stage') {
     throw new Error(`refusing to remove stage path ${stagePath}`);
   }
-  if (existsSync(stagePath) && lstatSync(stagePath).isSymbolicLink()) {
-    throw new Error(`refusing to remove symlink stage ${stagePath}`);
+}
+
+function identityOf(path) {
+  const st = lstatSync(path);
+  return `${st.dev}:${st.ino}`;
+}
+
+function assertSameDirectory(root, rootId, what) {
+  const now = lstatSync(root);
+  if (now.isSymbolicLink() || `${now.dev}:${now.ino}` !== rootId) {
+    throw new Error(`refusing to touch ${what}: ${root} is not the directory this run created`);
   }
+}
+
+/**
+ * Path under `root`. The leaf is not resolved, so a final symlink is not
+ * followed. A symlink parent that leaves `root` is refused.
+ */
+function locate(root, rootId, target) {
+  assertSameDirectory(root, rootId, target);
+  const absolute = resolve(target);
+  const leaf = basename(absolute);
+  if (leaf === '' || leaf === '.' || leaf === '..') throw new Error(`refusing to touch ${absolute}`);
+  const parent = physicalPath(dirname(absolute));
+  if (!isInside(root, parent)) throw new Error(`${absolute} leaves ${root} through a symlink`);
+  const full = join(parent, leaf);
+  if (!isInside(root, full) || full === root) throw new Error(`refusing to touch ${full}`);
+  return full;
+}
+
+/** Destination for a write. A symlink leaf is refused so the write cannot follow it. */
+function confined(root, rootId, target) {
+  const full = locate(root, rootId, target);
+  try {
+    if (lstatSync(full).isSymbolicLink()) throw new Error(`refusing to follow symlink ${full}`);
+  } catch (error) {
+    if (error.code !== 'ENOENT') throw error;
+  }
+  return full;
+}
+
+/** Remove a path under a directory this run created. A symlink leaf is unlinked, not followed. */
+function removeOwned(root, rootId, target) {
+  const full = locate(root, rootId, target);
+  let st;
+  try {
+    st = lstatSync(full);
+  } catch (error) {
+    if (error.code === 'ENOENT') return;
+    throw error;
+  }
+  if (st.isSymbolicLink()) {
+    rmSync(full, { force: true });
+    return;
+  }
+  rmSync(full, { recursive: true, force: true });
+}
+
+// The stage is scratch this build owns: exactly <prep>/stage/<version>,
+// already physical, and never a symlink.
+function removeStageScratch(stagePath, versionId) {
+  assertStageIdentity(stagePath, versionId);
+  let st;
+  try {
+    st = lstatSync(stagePath);
+  } catch (error) {
+    if (error.code === 'ENOENT') return;
+    throw error;
+  }
+  if (st.isSymbolicLink()) throw new Error(`refusing to remove symlink stage ${stagePath}`);
+  const parent = dirname(stagePath);
+  if (lstatSync(parent).isSymbolicLink()) throw new Error(`refusing to remove through symlink ${parent}`);
+  rmSync(stagePath, { recursive: true, force: true });
 }
 
 function run(cmd, cmdArgs, cwd) {
@@ -241,13 +377,21 @@ function assertResolvedTree(checkout, shell) {
 }
 
 const opt = args(process.argv.slice(2));
-const checkout = resolve(opt.checkout);
-const stage = resolve(opt.stage);
-const output = resolve(opt.output);
-const shell = resolve(opt.shell);
-const keyDir = resolve(opt.keyDir);
-const modules = resolve(opt.modules);
-const home = join(process.env.HOME ?? '', '.timon');
+const home = liveHome();
+const stageInput = resolve(opt.stage);
+const outputInput = resolve(opt.output);
+const stage = physicalPath(stageInput);
+const output = physicalPath(outputInput);
+const checkout = physicalPath(opt.checkout);
+const shell = physicalPath(opt.shell);
+const keyDir = physicalPath(opt.keyDir);
+const modules = physicalPath(opt.modules);
+// Symlink ancestors are resolved before the live-home check. A link that
+// leaves the preparation directory is refused before anything is created
+// or removed.
+assertNoEscapingSymlink(stageInput, stage);
+assertNoEscapingSymlink(outputInput, output);
+assertStageIdentity(stage, opt.versionId);
 for (const [path, what] of [[stage, 'stage'], [output, 'output'], [checkout, 'checkout']]) assertOutside(path, home, what);
 if (existsSync(output)) throw new Error(`output already exists: ${output}`);
 if (!existsSync(join(shell, 'resources', 'node', 'node'))) throw new Error(`${shell} is not a desktop-runtime release (no resources/node/node)`);
@@ -272,28 +416,34 @@ const prepare = await importer('desktop/scripts/prepare-daemon-release.mjs');
 const buildInfoMod = await importer('desktop/scripts/build-info.mjs');
 const integrity = await importer('desktop/scripts/release-integrity.mjs');
 
-assertRemovableStage(stage, opt.versionId);
-rmSync(stage, { recursive: true, force: true });
-mkdirSync(stage, { recursive: true });
+const stageNow = physicalPath(stageInput);
+assertNoEscapingSymlink(stageInput, stageNow);
+assertOutside(stageNow, liveHome(), 'stage');
+assertStageIdentity(stageNow, opt.versionId);
+if (stageNow !== stage) throw new Error(`stage path changed (${stageNow})`);
+removeStageScratch(stageNow, opt.versionId);
+mkdirSync(stageNow, { recursive: true });
+const stageId = identityOf(stageNow);
 const tsc = join(modules, 'typescript', 'bin', 'tsc');
+const outDir = confined(stageNow, stageId, join(stageNow, 'dist'));
 run(process.execPath, [
   tsc, '--project', join(checkout, 'orchestrator', 'tsconfig.json'),
-  '--outDir', join(stage, 'dist'), '--sourceMap', 'false', '--declaration', 'false',
+  '--outDir', outDir, '--sourceMap', 'false', '--declaration', 'false',
 ], checkout);
 
 for (const name of ['bin', 'presets', 'scripts']) {
-  cpSync(join(checkout, 'orchestrator', name), join(stage, name), { recursive: true, verbatimSymlinks: true });
+  cpSync(join(checkout, 'orchestrator', name), confined(stageNow, stageId, join(stageNow, name)), { recursive: true, verbatimSymlinks: true });
 }
 const pkg = JSON.parse(readFileSync(join(checkout, 'orchestrator', 'package.json'), 'utf8'));
 delete pkg.devDependencies;
 pkg.scripts = { start: 'node dist/index.js' };
-writeFileSync(join(stage, 'package.json'), `${JSON.stringify(pkg, null, 2)}\n`);
-rmSync(join(stage, 'dist', 'kernel', 'fixtures'), { recursive: true, force: true });
-rmSync(join(stage, 'scripts', 'test-plugin-hot-reload.mjs'), { force: true });
+writeFileSync(confined(stageNow, stageId, join(stageNow, 'package.json')), `${JSON.stringify(pkg, null, 2)}\n`);
+removeOwned(stageNow, stageId, join(stageNow, 'dist', 'kernel', 'fixtures'));
+removeOwned(stageNow, stageId, join(stageNow, 'scripts', 'test-plugin-hot-reload.mjs'));
 
-console.log(`[fork-build] ${prepare.copyBuiltinPlugins(stage, join(checkout, 'orchestrator'))} built-in plugin(s)`);
+console.log(`[fork-build] ${prepare.copyBuiltinPlugins(stageNow, join(checkout, 'orchestrator'))} built-in plugin(s)`);
 const info = buildInfoMod.createBuildInfo({ channel: 'stable', noExpiry: true });
-writeFileSync(join(stage, buildInfoMod.BUILD_INFO_FILE), `${JSON.stringify(info, null, 2)}\n`);
+writeFileSync(confined(stageNow, stageId, join(stageNow, buildInfoMod.BUILD_INFO_FILE)), `${JSON.stringify(info, null, 2)}\n`);
 console.log(`[fork-build] ${buildInfoMod.BUILD_INFO_FILE}: channel ${info.channel}, expires ${info.expiresAt ?? 'never'}`);
 
 let changelog = '';
@@ -302,11 +452,11 @@ catch { console.warn('[fork-build] changelog unavailable; release notes will be 
 const fragments = await importer('scripts/changelog-fragments.mjs');
 changelog = fragments.withUnreleased(changelog, fragments.readFragments(join(checkout, fragments.FRAGMENTS_DIR)));
 const notes = await importer('desktop/scripts/release-notes.mjs');
-writeFileSync(join(stage, 'scripts', 'release-notes.json'), `${JSON.stringify(notes.createReleaseNotes(changelog, pkg.version), null, 2)}\n`);
-cpSync(join(checkout, 'desktop', 'scripts', 'release-notes.mjs'), join(stage, 'scripts', 'release-notes.mjs'));
+writeFileSync(confined(stageNow, stageId, join(stageNow, 'scripts', 'release-notes.json')), `${JSON.stringify(notes.createReleaseNotes(changelog, pkg.version), null, 2)}\n`);
+cpSync(join(checkout, 'desktop', 'scripts', 'release-notes.mjs'), confined(stageNow, stageId, join(stageNow, 'scripts', 'release-notes.mjs')));
 
-await prepare.exportDocs(join(stage, 'public-docs'));
-const fence = prepare.stageFence(stage);
+await prepare.exportDocs(confined(stageNow, stageId, join(stageNow, 'public-docs')));
+const fence = prepare.stageFence(stageNow);
 if (fence) console.log(`[fork-build] mission launcher: ${fence}`);
 
 const privateKey = join(keyDir, 'fork-release.key.pem');
@@ -315,27 +465,38 @@ if (!existsSync(privateKey) || !existsSync(publicKey)) throw new Error(`missing 
 process.env.TIMON_RELEASE_PRIVATE_KEY_FILE = privateKey;
 process.env.TIMON_RELEASE_PUBLIC_KEY_FILE = publicKey;
 const keys = prepare.releaseKeys();
-const signed = prepare.sealTree(stage, keys);
+const signed = prepare.sealTree(stageNow, keys);
 console.log(`[fork-build] ${signed} files signed`);
 
-run('cp', ['-a', shell, output]);
-const orch = join(output, 'resources', 'orchestrator');
+const outputNow = physicalPath(outputInput);
+assertNoEscapingSymlink(outputInput, outputNow);
+assertOutside(outputNow, liveHome(), 'output');
+if (outputNow !== output) throw new Error(`output path changed (${outputNow})`);
+if (existsSync(outputNow)) throw new Error(`output already exists: ${outputNow}`);
+run('cp', ['-a', shell, outputNow]);
+const outputId = identityOf(outputNow);
+const orch = join(outputNow, 'resources', 'orchestrator');
 const replaced = ['dist', 'bin', 'presets', 'scripts', 'builtin-plugins', 'builtin-plugins.json', 'package.json', 'build-info.json', 'public-docs', 'native', 'release-manifest.json', 'release-manifest.sig'];
-for (const name of replaced) rmSync(join(orch, name), { recursive: true, force: true });
+for (const name of replaced) removeOwned(outputNow, outputId, join(orch, name));
 for (const name of replaced) {
-  const from = join(stage, name);
+  const from = join(stageNow, name);
   if (!existsSync(from)) continue;
-  const dest = join(orch, name);
-  cpSync(from, dest, { recursive: true, verbatimSymlinks: true });
+  cpSync(from, confined(outputNow, outputId, join(orch, name)), { recursive: true, verbatimSymlinks: true });
 }
 for (const name of ['dist', 'bin', 'scripts', 'presets', 'package.json', 'native']) {
-  const path = join(orch, name);
-  if (existsSync(path) && lstatSync(path).isSymbolicLink()) throw new Error(`signed path is a symlink: ${name}`);
+  const path = locate(outputNow, outputId, join(orch, name));
+  let st;
+  try { st = lstatSync(path); }
+  catch (error) {
+    if (error.code === 'ENOENT') continue;
+    throw error;
+  }
+  if (st.isSymbolicLink()) throw new Error(`signed path is a symlink: ${name}`);
 }
 integrity.verifyRelease(orch, keys.publicKey);
 console.log('[fork-build] sealed daemon matches the copied tree');
 
-writeFileSync(join(output, 'fork-build.json'), `${JSON.stringify({
+writeFileSync(confined(outputNow, outputId, join(outputNow, 'fork-build.json')), `${JSON.stringify({
   kind: 'timon-fork-runtime',
   versionId: opt.versionId,
   upstreamVersion: pkg.version,

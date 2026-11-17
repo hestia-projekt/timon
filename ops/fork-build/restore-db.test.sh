@@ -507,6 +507,182 @@ assert_err "symlink"
 assert_eq "$(stat -c '%a %u %i' -- "$shared")" "$shared_before" "shared kept when releases is a symlink"
 assert_eq "$(cat "$shared/marker")" "keep" "marker kept when releases is a symlink"
 
+# A symlink in the preparation directory that points at a disposable home
+# is refused. Nothing there is written or removed. This home is not ~/.timon.
+FAKE_USER=$ROOT_TMP/fake-user
+FAKE_HOME=$FAKE_USER/.timon
+case "$FAKE_HOME" in
+  "$ROOT_TMP"/*) ;;
+  *)
+    printf 'FAIL fake home is not under the temp dir\n' >&2
+    exit 1
+    ;;
+esac
+case "$FAKE_HOME" in
+  "$HOME/.timon"|"$HOME/.timon"/*)
+    printf 'FAIL fake home is the live Timon home\n' >&2
+    exit 1
+    ;;
+esac
+mkdir -p "$FAKE_HOME/stage/0.1.8-fork.abc" "$FAKE_HOME/0.1.8-fork.abc"
+printf 'keep-stage\n' > "$FAKE_HOME/stage/0.1.8-fork.abc/victim"
+printf 'keep-out\n' > "$FAKE_HOME/0.1.8-fork.abc/victim"
+printf 'keep-marker\n' > "$FAKE_HOME/marker"
+chmod 0700 "$FAKE_HOME"
+
+home_snapshot() {
+  find "$FAKE_HOME" -printf '%P %y\n' | sort
+}
+before_home=$(home_snapshot)
+
+run_assemble() {
+  HOME=$FAKE_USER node "$ROOT/assemble-release.mjs" \
+    --checkout "$1" \
+    --stage "$2" \
+    --output "$3" \
+    --shell "$4" \
+    --key-dir "$5" \
+    --version-id 0.1.8-fork.abc \
+    --commit abcdefabcdef \
+    --modules "$6"
+}
+
+# The lexical path ends in /stage/<version>. The old guard looked only at
+# that last component, so a link higher up walked into the fake home.
+prep_anc=$ROOT_TMP/prep-ancestor
+mkdir -p "$prep_anc"
+ln -s "$FAKE_HOME" "$prep_anc/escape"
+expect_fail run_assemble \
+  "$prep_anc/checkout" \
+  "$prep_anc/escape/stage/0.1.8-fork.abc" \
+  "$prep_anc/out/0.1.8-fork.abc" \
+  "$prep_anc/shell" \
+  "$prep_anc/keys" \
+  "$prep_anc/modules"
+assert_err "through symlink"
+assert_eq "$(home_snapshot)" "$before_home" "fake home after ancestor link"
+assert_eq "$(cat "$FAKE_HOME/stage/0.1.8-fork.abc/victim")" "keep-stage" "ancestor victim"
+if [ -e "$prep_anc/stage" ] || [ -e "$prep_anc/out" ]; then
+  printf 'FAIL preparation directory was written through an ancestor link\n' >&2
+  exit 1
+fi
+if [ ! -L "$prep_anc/escape" ]; then
+  printf 'FAIL ancestor symlink was replaced\n' >&2
+  exit 1
+fi
+
+# $PREP/stage and $PREP/out are themselves the links into the fake home.
+prep_stage=$ROOT_TMP/prep-stage-link
+mkdir -p "$prep_stage"
+ln -s "$FAKE_HOME" "$prep_stage/stage"
+ln -s "$FAKE_HOME" "$prep_stage/out"
+expect_fail run_assemble \
+  "$prep_stage/checkout" \
+  "$prep_stage/stage/0.1.8-fork.abc" \
+  "$prep_stage/out/0.1.8-fork.abc" \
+  "$prep_stage/shell" \
+  "$prep_stage/keys" \
+  "$prep_stage/modules"
+assert_err "through symlink"
+assert_eq "$(home_snapshot)" "$before_home" "fake home after stage link"
+assert_eq "$(cat "$FAKE_HOME/0.1.8-fork.abc/victim")" "keep-out" "stage-link victim"
+if [ ! -L "$prep_stage/stage" ] || [ ! -L "$prep_stage/out" ]; then
+  printf 'FAIL preparation symlink was replaced\n' >&2
+  exit 1
+fi
+
+# Output alone goes through the link. The stage path is real and must not be created.
+prep_out=$ROOT_TMP/prep-out-link
+mkdir -p "$prep_out"
+ln -s "$FAKE_HOME" "$prep_out/out"
+expect_fail run_assemble \
+  "$prep_out/checkout" \
+  "$prep_out/stage/0.1.8-fork.abc" \
+  "$prep_out/out/0.1.8-fork.abc" \
+  "$prep_out/shell" \
+  "$prep_out/keys" \
+  "$prep_out/modules"
+assert_err "through symlink"
+assert_eq "$(home_snapshot)" "$before_home" "fake home after output link"
+if [ -e "$prep_out/stage" ]; then
+  printf 'FAIL stage was created while output was refused\n' >&2
+  exit 1
+fi
+
+# No symlink: the path check passes and the build stops on the missing shell,
+# before creating the stage.
+prep_safe=$ROOT_TMP/prep-safe
+mkdir -p "$prep_safe"
+expect_fail run_assemble \
+  "$prep_safe/checkout" \
+  "$prep_safe/stage/0.1.8-fork.abc" \
+  "$prep_safe/out/0.1.8-fork.abc" \
+  "$prep_safe/shell" \
+  "$prep_safe/keys" \
+  "$prep_safe/modules"
+assert_err "not a desktop-runtime release"
+if [ -e "$prep_safe/stage" ] || [ -e "$prep_safe/out" ]; then
+  printf 'FAIL safe path created a directory\n' >&2
+  exit 1
+fi
+assert_eq "$(home_snapshot)" "$before_home" "fake home after safe path"
+
+old_data_home=$TIMON_FORK_DATA_HOME
+TIMON_FORK_DATA_HOME=$FAKE_HOME
+expect_die fork_confine "$prep_stage/stage/0.1.8-fork.abc" "$prep_stage" "stage"
+assert_err "leaves the preparation root"
+assert_eq "$(cat "$FAKE_HOME/0.1.8-fork.abc/victim")" "keep-out" "confine left victim"
+
+expect_die fork_remove_script_stage "$prep_stage/stage/0.1.8-fork.abc" "$prep_stage/stage" "0.1.8-fork.abc"
+assert_err "leaves the preparation root"
+assert_eq "$(cat "$FAKE_HOME/0.1.8-fork.abc/victim")" "keep-out" "remove left victim"
+if [ ! -L "$prep_stage/stage" ]; then
+  printf 'FAIL stage symlink was removed\n' >&2
+  exit 1
+fi
+
+expect_die fork_confine "$prep_stage/stage/0.1.8-fork.missing" "$prep_stage" "stage"
+assert_err "leaves the preparation root"
+if [ -e "$FAKE_HOME/0.1.8-fork.missing" ]; then
+  printf 'FAIL missing stage was created in the fake home\n' >&2
+  exit 1
+fi
+
+ok_prep=$ROOT_TMP/prep-confine-ok
+mkdir -p "$ok_prep"
+run_ok fork_confine "$ok_prep/stage/0.1.8-fork.abc" "$ok_prep" "stage"
+assert_eq "$(cat "$ROOT_TMP/out")" "$(realpath -m -- "$ok_prep/stage/0.1.8-fork.abc")" "confined path"
+if [ -e "$ok_prep/stage" ]; then
+  printf 'FAIL confine created the stage\n' >&2
+  exit 1
+fi
+
+real_prep=$ROOT_TMP/prep-real-stage
+mkdir -p "$real_prep/stage/0.1.8-fork.abc"
+printf 'gone\n' > "$real_prep/stage/0.1.8-fork.abc/f"
+run_ok fork_remove_script_stage "$real_prep/stage/0.1.8-fork.abc" "$real_prep/stage" "0.1.8-fork.abc"
+if [ -e "$real_prep/stage/0.1.8-fork.abc" ]; then
+  printf 'FAIL real stage was not removed\n' >&2
+  exit 1
+fi
+if [ ! -d "$real_prep/stage" ]; then
+  printf 'FAIL stage parent was removed\n' >&2
+  exit 1
+fi
+
+mkdir -p "$FAKE_HOME/sub"
+printf 'data\n' > "$FAKE_HOME/sub/file"
+chmod 0644 "$FAKE_HOME/sub/file"
+chmod 0755 "$FAKE_HOME/sub"
+priv_link=$ROOT_TMP/priv-link
+mkdir -p "$priv_link"
+ln -s "$FAKE_HOME" "$priv_link/alias"
+expect_die fork_privatize_tree "$priv_link/alias/sub"
+assert_err "inside the live Timon home"
+assert_eq "$(stat -c %a -- "$FAKE_HOME/sub/file")" "644" "privatize left file"
+assert_eq "$(stat -c %a -- "$FAKE_HOME/sub")" "755" "privatize left directory"
+TIMON_FORK_DATA_HOME=$old_data_home
+
 if [ -s "$FORK_TEST_SYSTEMCTL_LOG" ]; then
   printf 'FAIL systemctl was called\n' >&2
   cat "$FORK_TEST_SYSTEMCTL_LOG" >&2

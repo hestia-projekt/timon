@@ -31,6 +31,25 @@ fork_live_home_path() {
   fork_canonical_path "$(fork_home)"
 }
 
+# Physical path of $1. It must stay under the preparation root $2 and outside
+# the live Timon home. A symlink ancestor that resolves outside $2 is refused.
+# Nothing is created. Prints the physical path.
+fork_confine() {
+  fc_path=$1
+  fc_root=$2
+  fc_label=$3
+  [ -n "$fc_path" ] || fork_die "missing $fc_label"
+  [ -n "$fc_root" ] || fork_die "missing preparation root"
+  fc_canon=$(fork_canonical_path "$fc_path")
+  fc_root_canon=$(fork_canonical_path "$fc_root")
+  case "$fc_canon" in
+    "$fc_root_canon"/*) ;;
+    *) fork_die "$fc_label leaves the preparation root ($fc_canon)" ;;
+  esac
+  fork_assert_outside_home "$fc_canon" "$fc_label"
+  printf '%s\n' "$fc_canon"
+}
+
 # Refuse a path that is the live Timon home or lives inside it.
 # The home itself is never a write target: a caller path that resolves to it
 # is refused before anything is created or removed.
@@ -129,6 +148,8 @@ fork_version_id_ok() {
 }
 
 # Remove the stage directory this build owns: exactly <prep>/stage/<version>.
+# The preparation root is the parent of $2, resolved on its own, so a symlink
+# at $2 cannot make the stage and its parent agree after both are resolved.
 # Never the preparation directory, the live home, or a symlink.
 fork_remove_script_stage() {
   frs_stage=$1
@@ -141,16 +162,16 @@ fork_remove_script_stage() {
     fork_die "refusing to remove symlink $frs_stage"
   fi
   fork_version_id_ok "$frs_name"
-  frs_canon=$(fork_canonical_path "$frs_stage")
-  frs_parent_canon=$(fork_canonical_path "$frs_parent")
-  frs_home=$(fork_live_home_path)
-  if [ "$frs_canon" = "$frs_home" ] || [ "$frs_canon" = "$frs_parent_canon" ]; then
-    fork_die "refusing to remove $frs_canon"
-  fi
+  frs_anchor=$(dirname -- "$frs_parent")
+  frs_canon=$(fork_confine "$frs_stage" "$frs_anchor" "stage")
+  frs_anchor_canon=$(fork_canonical_path "$frs_anchor")
   case "$frs_canon" in
-    "$frs_parent_canon"/"$frs_name") ;;
+    "$frs_anchor_canon"/stage/"$frs_name") ;;
     *) fork_die "refusing to remove $frs_canon" ;;
   esac
+  if [ -L "$frs_canon" ]; then
+    fork_die "refusing to remove symlink $frs_canon"
+  fi
   rm -rf -- "$frs_canon"
 }
 
@@ -331,7 +352,8 @@ fork_sqlite_backup() {
 # The root itself is not chmodded: it was created mode 0700, and a directory
 # the caller named must never be restricted here. A root that is not already
 # a private directory (owner, mode 0700), a symlink, or the live home is refused
-# before any chmod. New files are already 0600 under umask 077, but cp -a and
+# before any chmod. A path that resolves inside the live home is refused too,
+# not only a path that is the home itself. New files are already 0600 under umask 077, but cp -a and
 # rsync -a keep the source mode, so a copied database or release would stay
 # 0644/0755. Directories under the root become 0700. A file that was executable
 # stays owner-executable (0700): rollback runs the saved node binary. Every
@@ -342,10 +364,7 @@ fork_privatize_tree() {
   [ -d "$root" ] || fork_die "cannot restrict $root"
   [ ! -L "$root" ] || fork_die "refusing to restrict a symlink: $root"
   fpt_root=$(fork_canonical_path "$root")
-  fpt_home=$(fork_live_home_path)
-  if [ "$fpt_root" = "$fpt_home" ]; then
-    fork_die "refusing to restrict the live Timon home"
-  fi
+  fork_assert_outside_home "$fpt_root" "backup"
   fpt_owner=$(stat -c %u -- "$fpt_root") || fork_die "cannot read ownership of $root"
   fpt_mode=$(stat -c %a -- "$fpt_root") || fork_die "cannot read mode of $root"
   if [ "$fpt_owner" != "$(id -u)" ] || [ "$fpt_mode" != "700" ]; then

@@ -32,17 +32,11 @@ RUNNER="$ORCH/dist/host/packaged-runner.js"
 PREP=$(fork_canonical_path "$(dirname -- "$PACKAGE")")
 fork_assert_outside_home "$PREP" "preparation directory"
 SMOKE=$(mktemp -d "$PREP/smoke.XXXXXX")
-smoke_canon=$(fork_canonical_path "$SMOKE")
-home_canon=$(fork_live_home_path)
-if [ "$smoke_canon" = "$home_canon" ]; then
-  fork_die "temporary home is the live Timon home"
-fi
-case "$smoke_canon" in
-  "$home_canon"/*)
-    rm -rf -- "$SMOKE"
-    fork_die "temporary home landed inside the live home"
-    ;;
-esac
+# A smoke directory that resolved into the live home is left in place.
+# Removing it would delete that home.
+smoke_canon=$(fork_confine "$SMOKE" "$PREP" "temporary home")
+SMOKE=$smoke_canon
+smoke_token=$(stat -c '%d:%i' -- "$SMOKE")
 
 PORT=$(node -e 'const net = require("node:net"); const s = net.createServer(); s.listen(0, "127.0.0.1", () => { process.stdout.write(String(s.address().port)); s.close(); });')
 UNIT="timon-fork-verify-$$"
@@ -54,7 +48,7 @@ cleanup() {
   ec=$?
   systemctl --user stop "$UNIT" >/dev/null 2>&1 || true
   if [ "${KEEP_SMOKE:-}" != 1 ]; then
-    rm -rf -- "$SMOKE"
+    fork_remove_created_dir "$SMOKE" "$PREP" "$smoke_token" || true
   fi
   exit "$ec"
 }

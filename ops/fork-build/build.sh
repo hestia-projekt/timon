@@ -53,10 +53,21 @@ UPSTREAM=$(git -C "$REPO" show "$COMMIT:orchestrator/package.json" | sed -n 's/.
 VERSION_ID="${UPSTREAM}-fork.${SHORT}"
 fork_version_id_ok "$VERSION_ID"
 
-SRC="$PREP/src/$COMMIT"
-STAGE="$PREP/stage/$VERSION_ID"
-OUT="$PREP/out/$VERSION_ID"
-KEYS="$PREP/keys/$VERSION_ID"
+# Resolve every path this run will create. A symlink under the preparation
+# directory that points elsewhere (the live home included) is refused here,
+# before a worktree, a key, or a stage directory is created.
+stage_want="$PREP/stage/$VERSION_ID"
+out_want="$PREP/out/$VERSION_ID"
+src_want="$PREP/src/$COMMIT"
+keys_want="$PREP/keys/$VERSION_ID"
+STAGE=$(fork_confine "$stage_want" "$PREP" "stage")
+OUT=$(fork_confine "$out_want" "$PREP" "output")
+SRC=$(fork_confine "$src_want" "$PREP" "checkout")
+KEYS=$(fork_confine "$keys_want" "$PREP" "keys")
+[ "$STAGE" = "$stage_want" ] || fork_die "stage leaves the preparation root ($STAGE)"
+[ "$OUT" = "$out_want" ] || fork_die "output leaves the preparation root ($OUT)"
+[ "$SRC" = "$src_want" ] || fork_die "checkout leaves the preparation root ($SRC)"
+[ "$KEYS" = "$keys_want" ] || fork_die "keys leave the preparation root ($KEYS)"
 
 if [ -e "$OUT" ]; then
   fork_die "package already exists at $OUT (remove it to rebuild)"
