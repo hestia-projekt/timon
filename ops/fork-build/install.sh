@@ -59,12 +59,16 @@ fork_assert_outside_home "$BACKUP_ROOT" "backup directory"
 
 # Stop before copying. The daemon keeps writing the home, so a second rsync
 # would never match, and a hot copy would not be the tree we can restore.
-# Any exit while the service is stopped (set -e included) puts it back.
+# A failure before the backup exists starts the previous unit again.
+# After the backup exists, a failure restores it in a subshell. The restore
+# returns on error instead of exiting, so the branch below still starts the
+# unit. The unit and pointer are written back before the databases and the
+# health check, so that start runs the saved unit when a later step fails.
 phase=idle
 put_service_back() {
   ec=$?
   current=$phase
-  phase=done
+  phase="done"
   case "$current" in
     stopped)
       printf 'starting the previous service\n' >&2
@@ -72,7 +76,7 @@ put_service_back() {
       ;;
     backed-up)
       printf 'restoring the previous service\n' >&2
-      if fork_restore_backup "$DEST"; then
+      if ( fork_restore_backup "$DEST" ); then
         # The copy is not what the unit runs anymore. A retry can install it again.
         rm -rf -- "$TARGET"
       else
@@ -129,6 +133,7 @@ cp -a -- "$PACKAGE" "$TARGET"
 
 OLD_PATH="$HOME_DIR/desktop-runtime/releases/$ACTIVE"
 NEW_PATH="$TARGET"
+# shellcheck disable=SC2016 # node source stays single-quoted so the shell does not expand it
 node --input-type=module -e '
   import { readFileSync, writeFileSync } from "node:fs";
   const file = process.argv[1];
@@ -148,6 +153,6 @@ printf '%s\n' "$VERSION_ID" > "$HOME_DIR/desktop-runtime/active-release"
 systemctl --user daemon-reload
 systemctl --user restart "$UNIT_NAME"
 fork_health "$PORT" 60 >/dev/null
-phase=done
+phase="done"
 printf 'active-release %s\n' "$VERSION_ID"
 printf 'rollback: %s --backup %s --apply\n' "$(fork_script_dir "$SCRIPT")/rollback.sh" "$DEST"

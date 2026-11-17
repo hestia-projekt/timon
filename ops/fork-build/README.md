@@ -62,7 +62,7 @@ Avec `--apply`, dans l'ordre :
    - une copie de la release officielle courante, vérifiée par le SHA-256 de `release-manifest.json` et le nombre de fichiers ;
    - l'unité systemd et le pointeur `active-release` tels qu'ils étaient.
 4. Il copie le paquet dans `desktop-runtime/releases/<id>/`, réécrit les chemins de l'unité (les drop-ins, dont le port de l'application, ne sont pas touchés), pose le pointeur, recharge systemd et redémarre l'unité.
-5. Il attend `/api/health` (`service` vaut `timon`, pas d'attente d'approbation). Si le redémarrage ou la santé échoue, il remet l'unité et le pointeur, restaure une base dont le schéma a changé, et retire la copie du paquet.
+5. Il attend `/api/health` (`service` vaut `timon`, pas d'attente d'approbation). Si le redémarrage ou la santé échoue, il exécute le retour arrière décrit plus bas, puis retire la copie du paquet. Si ce retour arrière échoue à son tour, l'unité dont les fichiers viennent d'être remis est tout de même relancée.
 
 La bascule ne passe pas par `timon update apply`.
 
@@ -73,7 +73,16 @@ ops/fork-build/rollback.sh --backup ~/timon-fork-backups/<date>
 ops/fork-build/rollback.sh --backup ~/timon-fork-backups/<date> --apply
 ```
 
-Avec `--apply` : si le démon répond, le script refuse tant qu'une mission tourne. Il arrête l'unité, remet l'unité et le pointeur sauvegardés, restaure `timon.db` ou `integrations.db` seulement si l'empreinte du schéma diffère de celle de la sauvegarde, redémarre, et attend `/api/health`.
+Avec `--apply` : si le démon répond, le script refuse tant qu'une mission tourne. La restauration suit cet ordre :
+
+1. Arrêt de l'unité.
+2. Remise du fichier d'unité et du pointeur `active-release` sauvegardés.
+3. Lecture de `activeRelease` dans `manifest.json`. Si `desktop-runtime/releases/<activeRelease>/resources/orchestrator/dist/host/packaged-runner.js` est absent, copie de `official-release` vers ce répertoire (un répertoire incomplet est retiré avant, pour que la copie porte le nom de la release), puis vérification du SHA-256 de `release-manifest.json`.
+4. Rechargement de systemd (`daemon-reload`).
+5. Restauration de `timon.db` ou `integrations.db` seulement si l'empreinte du schéma diffère de celle de la sauvegarde.
+6. Redémarrage de l'unité et attente de `/api/health`.
+
+En cas d'échec, `fork_restore_backup` rend la main au lieu de quitter le shell. `install.sh` relance alors l'unité. `rollback.sh` s'arrête sur la même erreur.
 
 Remettre la base remplace aussi les écritures faites après la bascule. Si le schéma n'a pas bougé, la base en service est laissée telle quelle.
 
@@ -89,7 +98,7 @@ git log --oneline upstream/main..origin/main
 Pour chaque release amont :
 
 1. `git fetch upstream` et partir de `upstream/main` (ou de l'étiquette de la release).
-2. Rejouer les commits propres au fork (`git rebase --onto upstream/main <ancienne-base> <branche-du-fork>`). Les fichiers de `ops/fork-build/` et `docs/fork-build.md` ne touchent pas le code amont : ils se rejouent tels quels. Un conflit dans le démon se résout avant le build, jamais en forçant.
+2. Rejouer les commits propres au fork (`git rebase --onto upstream/main <ancienne-base> <branche-du-fork>`). Les fichiers de `ops/fork-build/` ne touchent pas le code amont : ils se rejouent tels quels. Un conflit dans le démon se résout avant le build, jamais en forçant.
 3. Relancer le build sur le nouveau SHA, avec `--shell` pointant la release officielle qui correspond au numéro de version, une fois qu'elle est installée dans `desktop-runtime/releases/`. Si `orchestrator/package.json` a de nouvelles dépendances, le build s'arrête : les modules natifs de l'ancienne coque ne conviennent plus.
 4. `verify.sh`, puis `install.sh --apply` quand aucune mission ne tourne. L'install prend une nouvelle sauvegarde.
 

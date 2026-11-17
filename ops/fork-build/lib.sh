@@ -116,27 +116,126 @@ fork_maybe_restore_db() {
     return 0
   fi
   rm -f -- "${live}-wal" "${live}-shm"
-  cp -a -- "$dest/db/$name" "$live"
-  check=$(sqlite3 "$live" "PRAGMA integrity_check;")
-  [ "$check" = "ok" ] || fork_die "restored $name failed integrity_check"
+  cp -a -- "$dest/db/$name" "$live" || {
+    printf 'fork-build: could not restore %s\n' "$name" >&2
+    return 1
+  }
+  check=$(sqlite3 "$live" "PRAGMA integrity_check;") || {
+    printf 'fork-build: restored %s failed integrity_check\n' "$name" >&2
+    return 1
+  }
+  if [ "$check" != "ok" ]; then
+    printf 'fork-build: restored %s failed integrity_check\n' "$name" >&2
+    return 1
+  fi
   printf '%s restored\n' "$name"
 }
 
-# Stop the service, put the saved unit and pointer back, restore a database
-# whose schema changed, then start again and wait for health.
+# Stop the service, put the saved unit and pointer back, put the official
+# release tree back when its runner is gone, restore a database whose schema
+# changed, then start again and wait for health.
+# Returns 1 on failure and does not exit the shell. install.sh calls this from
+# `if`, where dash ignores set -e, so each step checks its own status. The
+# caller can then start the unit that this function has already put back.
 fork_restore_backup() {
   dest=$1
-  [ -f "$dest/manifest.json" ] || fork_die "no manifest in $dest"
-  unit=$(jq -r '.unit' "$dest/manifest.json")
-  port=$(jq -r '.port' "$dest/manifest.json")
+  if [ ! -f "$dest/manifest.json" ]; then
+    printf 'fork-build: no manifest in %s\n' "$dest" >&2
+    return 1
+  fi
+  unit=$(jq -r '.unit' "$dest/manifest.json") || {
+    printf 'fork-build: cannot read %s\n' "$dest/manifest.json" >&2
+    return 1
+  }
+  port=$(jq -r '.port' "$dest/manifest.json") || {
+    printf 'fork-build: cannot read %s\n' "$dest/manifest.json" >&2
+    return 1
+  }
+  active=$(jq -r '.activeRelease' "$dest/manifest.json") || {
+    printf 'fork-build: cannot read %s\n' "$dest/manifest.json" >&2
+    return 1
+  }
+  if [ -z "$unit" ] || [ "$unit" = "null" ]; then
+    printf 'fork-build: backup manifest has no unit\n' >&2
+    return 1
+  fi
+  if [ -z "$port" ] || [ "$port" = "null" ]; then
+    printf 'fork-build: backup manifest has no port\n' >&2
+    return 1
+  fi
+  # "." and ".." pass the version pattern and would walk out of releases/ on rm.
+  if ! printf '%s' "$active" | grep -Eq '^[0-9A-Za-z._-]{1,80}$' \
+    || [ "$active" = "." ] || [ "$active" = ".." ]; then
+    printf 'fork-build: refusing version id %s\n' "$active" >&2
+    return 1
+  fi
   unit_file=$(fork_unit_file)
-  systemctl --user stop "$unit"
-  fork_maybe_restore_db "$dest" timon.db "$(jq -r '.databases["timon.db"].fingerprint' "$dest/manifest.json")"
-  fork_maybe_restore_db "$dest" integrations.db "$(jq -r '.databases["integrations.db"].fingerprint' "$dest/manifest.json")"
-  cp -a -- "$dest/unit.service" "$unit_file"
-  cp -a -- "$dest/active-release" "$(fork_home)/desktop-runtime/active-release"
-  systemctl --user daemon-reload
-  systemctl --user start "$unit"
-  fork_health "$port" 60 >/dev/null || fork_die "restored service did not answer on port $port; backup left at $dest"
+  release_dir="$(fork_home)/desktop-runtime/releases/$active"
+  runner="$release_dir/resources/orchestrator/dist/host/packaged-runner.js"
+
+  systemctl --user stop "$unit" || {
+    printf 'fork-build: could not stop %s\n' "$unit" >&2
+    return 1
+  }
+  cp -a -- "$dest/unit.service" "$unit_file" || {
+    printf 'fork-build: could not restore the unit file\n' >&2
+    return 1
+  }
+  cp -a -- "$dest/active-release" "$(fork_home)/desktop-runtime/active-release" || {
+    printf 'fork-build: could not restore active-release\n' >&2
+    return 1
+  }
+  if [ ! -f "$runner" ]; then
+    # cp -a copies into a directory that already exists, which would nest the
+    # backup. Drop a partial tree so the copy becomes the release directory.
+    if [ -e "$release_dir" ]; then
+      rm -rf -- "$release_dir" || {
+        printf 'fork-build: could not remove incomplete release %s\n' "$active" >&2
+        return 1
+      }
+    fi
+    mkdir -p -- "$(fork_home)/desktop-runtime/releases" || {
+      printf 'fork-build: could not create the releases directory\n' >&2
+      return 1
+    }
+    cp -a -- "$dest/official-release" "$release_dir" || {
+      printf 'fork-build: could not restore official release %s\n' "$active" >&2
+      return 1
+    }
+    src_manifest="$dest/official-release/resources/orchestrator/release-manifest.json"
+    dst_manifest="$release_dir/resources/orchestrator/release-manifest.json"
+    if [ ! -f "$src_manifest" ] || [ ! -f "$dst_manifest" ]; then
+      printf 'fork-build: release-manifest.json missing after restoring %s\n' "$active" >&2
+      return 1
+    fi
+    src_sum=$(sha256sum "$src_manifest" | awk '{print $1}')
+    dst_sum=$(sha256sum "$dst_manifest" | awk '{print $1}')
+    if [ -z "$src_sum" ] || [ "$src_sum" != "$dst_sum" ]; then
+      printf 'fork-build: restored release-manifest.json for %s does not match the backup\n' "$active" >&2
+      return 1
+    fi
+  fi
+  systemctl --user daemon-reload || {
+    printf 'fork-build: daemon-reload failed\n' >&2
+    return 1
+  }
+  timon_fp=$(jq -r '.databases["timon.db"].fingerprint' "$dest/manifest.json") || {
+    printf 'fork-build: cannot read %s\n' "$dest/manifest.json" >&2
+    return 1
+  }
+  integrations_fp=$(jq -r '.databases["integrations.db"].fingerprint' "$dest/manifest.json") || {
+    printf 'fork-build: cannot read %s\n' "$dest/manifest.json" >&2
+    return 1
+  }
+  fork_maybe_restore_db "$dest" timon.db "$timon_fp" || return 1
+  fork_maybe_restore_db "$dest" integrations.db "$integrations_fp" || return 1
+  systemctl --user start "$unit" || {
+    printf 'fork-build: could not start %s\n' "$unit" >&2
+    return 1
+  }
+  if ! fork_health "$port" 60 >/dev/null; then
+    printf 'fork-build: restored service did not answer on port %s; backup left at %s\n' "$port" "$dest" >&2
+    return 1
+  fi
   printf 'restored %s\n' "$dest"
 }
