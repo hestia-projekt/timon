@@ -20,17 +20,257 @@ fork_home() {
   printf '%s\n' "${TIMON_FORK_DATA_HOME:-$HOME/.timon}"
 }
 
-# Refuse a path that lives in the live Timon home.
+# Physical path. The last component may be missing; existing symlinks are
+# followed. This does not create anything.
+fork_canonical_path() {
+  [ -n "$1" ] || fork_die "missing path"
+  realpath -m -- "$1" || fork_die "cannot resolve $1"
+}
+
+fork_live_home_path() {
+  fork_canonical_path "$(fork_home)"
+}
+
+# Refuse a path that is the live Timon home or lives inside it.
+# The home itself is never a write target: a caller path that resolves to it
+# is refused before anything is created or removed.
 fork_assert_outside_home() {
-  home=$(cd -- "$(fork_home)" && pwd -P)
-  target=$(cd -- "$1" && pwd -P) || fork_die "cannot read $1"
-  case "$target" in
-    "$home"|"$home"/*) fork_die "$2 is inside the live Timon home ($home)" ;;
+  fah_home=$(fork_live_home_path)
+  fah_target=$(fork_canonical_path "$1")
+  if [ "$fah_target" = "$fah_home" ]; then
+    fork_die "$2 is the live Timon home ($fah_home); refusing"
+  fi
+  case "$fah_target" in
+    "$fah_home"/*) fork_die "$2 is inside the live Timon home ($fah_home)" ;;
   esac
 }
 
+# A directory the caller named. Nothing that already exists is chmodded.
+#   create   — missing: create it mode 0700. Existing parents are not changed.
+#   existing — it must already exist.
+#   check    — existing directory: same rules. Missing: resolve only.
+# An existing directory is accepted only when this user owns it and it is
+# already mode 0700 (no group, other, sticky, or setgid bit).
+fork_prepare_private_dir() {
+  fpp_raw=$1
+  fpp_label=$2
+  fpp_how=$3
+  case "$fpp_how" in
+    create|existing|check) ;;
+    *) fork_die "bad private-dir mode $fpp_how" ;;
+  esac
+  [ -n "$fpp_raw" ] || fork_die "missing $fpp_label"
+  fpp_target=$(fork_canonical_path "$fpp_raw")
+  fork_assert_outside_home "$fpp_target" "$fpp_label"
+  if [ ! -e "$fpp_target" ] && [ ! -L "$fpp_target" ]; then
+    if [ "$fpp_how" = "existing" ]; then
+      fork_die "$fpp_label does not exist: $fpp_target"
+    fi
+    if [ "$fpp_how" = "create" ]; then
+      # Parents that already exist are left alone. Only the new leaf is 0700.
+      fpp_parent=$(dirname -- "$fpp_target")
+      if [ ! -d "$fpp_parent" ]; then
+        mkdir -p -- "$fpp_parent" || fork_die "cannot create $fpp_label $fpp_target"
+      fi
+      if [ ! -e "$fpp_target" ] && [ ! -L "$fpp_target" ]; then
+        mkdir -m 0700 -- "$fpp_target" || fork_die "cannot create $fpp_label $fpp_target"
+      fi
+    fi
+  fi
+  if [ -e "$fpp_target" ] || [ -L "$fpp_target" ]; then
+    fork_require_private_dir "$fpp_target" "$fpp_label"
+  fi
+  printf '%s\n' "$fpp_target"
+}
+
+# Ownership and mode of a directory the caller named. Does not chmod it.
+fork_require_private_dir() {
+  frp_target=$1
+  frp_label=$2
+  if [ -L "$frp_target" ] || [ ! -d "$frp_target" ]; then
+    fork_die "$frp_label is not a directory: $frp_target"
+  fi
+  frp_owner=$(stat -c %u -- "$frp_target") || fork_die "cannot read ownership of $frp_target"
+  frp_mode=$(stat -c %a -- "$frp_target") || fork_die "cannot read mode of $frp_target"
+  frp_me=$(id -u)
+  if [ "$frp_owner" != "$frp_me" ]; then
+    fork_die "$frp_label $frp_target is owned by uid $frp_owner, not $frp_me (not changing it)"
+  fi
+  if [ "$frp_mode" != "700" ]; then
+    fork_die "$frp_label $frp_target is mode $frp_mode, expected 700 (not changing it)"
+  fi
+}
+
+# A directory that exists. Symlinks are resolved; the result is not a link.
+fork_existing_dir() {
+  fed_raw=$1
+  fed_label=$2
+  [ -n "$fed_raw" ] || fork_die "missing $fed_label"
+  if [ ! -e "$fed_raw" ] && [ ! -L "$fed_raw" ]; then
+    fork_die "$fed_label not found: $fed_raw"
+  fi
+  fed_target=$(fork_canonical_path "$fed_raw")
+  if [ -L "$fed_target" ] || [ ! -d "$fed_target" ]; then
+    fork_die "$fed_label is not a directory: $fed_target"
+  fi
+  printf '%s\n' "$fed_target"
+}
+
+fork_version_id_safe() {
+  printf '%s' "$1" | grep -Eq '^[0-9A-Za-z._-]{1,80}$' || return 1
+  case "$1" in
+    .|..) return 1 ;;
+  esac
+  return 0
+}
+
 fork_version_id_ok() {
-  printf '%s' "$1" | grep -Eq '^[0-9A-Za-z._-]{1,80}$' || fork_die "refusing version id $1"
+  fork_version_id_safe "$1" || fork_die "refusing version id $1"
+}
+
+# Remove the stage directory this build owns: exactly <prep>/stage/<version>.
+# Never the preparation directory, the live home, or a symlink.
+fork_remove_script_stage() {
+  frs_stage=$1
+  frs_parent=$2
+  frs_name=$3
+  if [ ! -e "$frs_stage" ] && [ ! -L "$frs_stage" ]; then
+    return 0
+  fi
+  if [ -L "$frs_stage" ]; then
+    fork_die "refusing to remove symlink $frs_stage"
+  fi
+  fork_version_id_ok "$frs_name"
+  frs_canon=$(fork_canonical_path "$frs_stage")
+  frs_parent_canon=$(fork_canonical_path "$frs_parent")
+  frs_home=$(fork_live_home_path)
+  if [ "$frs_canon" = "$frs_home" ] || [ "$frs_canon" = "$frs_parent_canon" ]; then
+    fork_die "refusing to remove $frs_canon"
+  fi
+  case "$frs_canon" in
+    "$frs_parent_canon"/"$frs_name") ;;
+    *) fork_die "refusing to remove $frs_canon" ;;
+  esac
+  rm -rf -- "$frs_canon"
+}
+
+# Remove a directory this run created. $3 is its device:inode at creation.
+# A symlink, the live home, a path that is not exactly one child of $2, or a
+# different inode is left in place.
+fork_remove_created_dir() {
+  frc_dir=$1
+  frc_parent=$2
+  frc_token=$3
+  if [ ! -e "$frc_dir" ] && [ ! -L "$frc_dir" ]; then
+    return 0
+  fi
+  if [ -L "$frc_dir" ]; then
+    printf 'fork-build: refusing to remove symlink %s\n' "$frc_dir" >&2
+    return 1
+  fi
+  frc_canon=$(realpath -m -- "$frc_dir") || {
+    printf 'fork-build: cannot resolve %s\n' "$frc_dir" >&2
+    return 1
+  }
+  frc_parent_canon=$(realpath -m -- "$frc_parent") || {
+    printf 'fork-build: cannot resolve %s\n' "$frc_parent" >&2
+    return 1
+  }
+  frc_home=$(realpath -m -- "$(fork_home)") || {
+    printf 'fork-build: cannot resolve the live Timon home\n' >&2
+    return 1
+  }
+  if [ "$frc_canon" = "$frc_home" ]; then
+    printf 'fork-build: refusing to remove the live Timon home\n' >&2
+    return 1
+  fi
+  case "$frc_canon" in
+    "$frc_parent_canon"/*) ;;
+    *)
+      printf 'fork-build: refusing to remove %s\n' "$frc_canon" >&2
+      return 1
+      ;;
+  esac
+  frc_rest=${frc_canon#"$frc_parent_canon"/}
+  case "$frc_rest" in
+    */*|"")
+      printf 'fork-build: refusing to remove %s\n' "$frc_canon" >&2
+      return 1
+      ;;
+  esac
+  frc_now=$(stat -c '%d:%i' -- "$frc_canon") || {
+    printf 'fork-build: cannot stat %s\n' "$frc_canon" >&2
+    return 1
+  }
+  if [ "$frc_now" != "$frc_token" ]; then
+    printf 'fork-build: refusing to remove %s (not the directory this run created)\n' "$frc_canon" >&2
+    return 1
+  fi
+  rm -rf -- "$frc_canon"
+}
+
+# Move an incomplete official release aside so the backup can take its name.
+# The tree is not deleted: this run did not create it. A symlink, the live
+# home, or a path that is not <home>/desktop-runtime/releases/<id> is refused.
+# Prints the aside path when a directory was moved. Prints nothing when the
+# release directory is already absent.
+fork_move_incomplete_release() {
+  if ! fork_version_id_safe "$1"; then
+    printf 'fork-build: refusing version id %s\n' "$1" >&2
+    return 1
+  fi
+  fmi_home=$(fork_home)
+  fmi_home_phys=$(realpath -m -- "$fmi_home") || {
+    printf 'fork-build: cannot resolve the live Timon home\n' >&2
+    return 1
+  }
+  fmi_releases="$fmi_home/desktop-runtime/releases"
+  fmi_release="$fmi_releases/$1"
+  # Refuse a symlink before resolving it. realpath would follow it into a
+  # directory this run did not create.
+  if [ -L "$fmi_releases" ]; then
+    printf 'fork-build: releases directory is a symlink\n' >&2
+    return 1
+  fi
+  if [ -L "$fmi_release" ]; then
+    printf 'fork-build: release path is a symlink\n' >&2
+    return 1
+  fi
+  fmi_phys=$(realpath -m -- "$fmi_release") || {
+    printf 'fork-build: cannot resolve %s\n' "$fmi_release" >&2
+    return 1
+  }
+  case "$fmi_phys" in
+    "$fmi_home_phys"/desktop-runtime/releases/"$1") ;;
+    *)
+      printf 'fork-build: refusing to touch release path %s\n' "$fmi_phys" >&2
+      return 1
+      ;;
+  esac
+  if [ "$fmi_phys" = "$fmi_home_phys" ]; then
+    printf 'fork-build: refusing to touch the live Timon home\n' >&2
+    return 1
+  fi
+  if [ ! -e "$fmi_release" ]; then
+    return 0
+  fi
+  if [ ! -d "$fmi_release" ]; then
+    printf 'fork-build: release path is not a directory\n' >&2
+    return 1
+  fi
+  fmi_aside="$fmi_releases/$1.incomplete"
+  if [ -e "$fmi_aside" ] || [ -L "$fmi_aside" ]; then
+    fmi_aside="$fmi_releases/$1.incomplete.$(date -u +%Y%m%dT%H%M%SZ)"
+  fi
+  if [ -e "$fmi_aside" ] || [ -L "$fmi_aside" ]; then
+    printf 'fork-build: aside path already exists: %s\n' "$fmi_aside" >&2
+    return 1
+  fi
+  if ! mv -- "$fmi_release" "$fmi_aside"; then
+    printf 'fork-build: could not move incomplete release %s\n' "$1" >&2
+    return 1
+  fi
+  printf '%s\n' "$fmi_aside"
 }
 
 # Same id the packaged unit uses: sha256 of the absolute home, 24 hex digits.
@@ -87,20 +327,34 @@ fork_sqlite_backup() {
   fork_schema_fingerprint "$dest"
 }
 
-# Drop group and other access on a backup tree. New files are already 0600
-# under umask 077, but cp -a and rsync -a keep the source mode, so a copied
-# database or a copied release would stay 0644/0755. Directories become 0700.
-# A file that was executable stays owner-executable (0700): rollback runs the
-# saved node binary. Every other file becomes 0600. Then the modes are read
-# back and a group or other bit is a failure.
+# Drop group and other access on a timestamped backup this run created.
+# The root itself is not chmodded: it was created mode 0700, and a directory
+# the caller named must never be restricted here. A root that is not already
+# a private directory (owner, mode 0700), a symlink, or the live home is refused
+# before any chmod. New files are already 0600 under umask 077, but cp -a and
+# rsync -a keep the source mode, so a copied database or release would stay
+# 0644/0755. Directories under the root become 0700. A file that was executable
+# stays owner-executable (0700): rollback runs the saved node binary. Every
+# other file becomes 0600. Then the modes are read back and a group or other
+# bit is a failure.
 fork_privatize_tree() {
   root=$1
   [ -d "$root" ] || fork_die "cannot restrict $root"
-  chmod 0700 "$root" || fork_die "cannot restrict $root"
-  find "$root" -type d -exec chmod 0700 {} + || fork_die "cannot restrict directories under $root"
-  find "$root" -type f -perm /111 -exec chmod 0700 {} + || fork_die "cannot restrict executables under $root"
-  find "$root" -type f ! -perm /111 -exec chmod 0600 {} + || fork_die "cannot restrict files under $root"
-  bad=$(find "$root" \( \( -type d ! -perm 0700 \) -o \( -type f -perm /077 \) \) -print | head -n 5)
+  [ ! -L "$root" ] || fork_die "refusing to restrict a symlink: $root"
+  fpt_root=$(fork_canonical_path "$root")
+  fpt_home=$(fork_live_home_path)
+  if [ "$fpt_root" = "$fpt_home" ]; then
+    fork_die "refusing to restrict the live Timon home"
+  fi
+  fpt_owner=$(stat -c %u -- "$fpt_root") || fork_die "cannot read ownership of $root"
+  fpt_mode=$(stat -c %a -- "$fpt_root") || fork_die "cannot read mode of $root"
+  if [ "$fpt_owner" != "$(id -u)" ] || [ "$fpt_mode" != "700" ]; then
+    fork_die "refusing to restrict $fpt_root (owned by uid $fpt_owner, mode $fpt_mode); not changing it"
+  fi
+  find "$fpt_root" -mindepth 1 -type d -exec chmod 0700 {} + || fork_die "cannot restrict directories under $root"
+  find "$fpt_root" -type f -perm /111 -exec chmod 0700 {} + || fork_die "cannot restrict executables under $root"
+  find "$fpt_root" -type f ! -perm /111 -exec chmod 0600 {} + || fork_die "cannot restrict files under $root"
+  bad=$(find "$fpt_root" \( \( -type d ! -perm 0700 \) -o \( -type f -perm /077 \) \) -print | head -n 5)
   [ -z "$bad" ] || fork_die "backup is readable by group or other: $bad"
 }
 
@@ -344,9 +598,8 @@ fork_restore_backup() {
     printf 'fork-build: backup manifest has no port\n' >&2
     return 1
   fi
-  # "." and ".." pass the version pattern and would walk out of releases/ on rm.
-  if ! printf '%s' "$active" | grep -Eq '^[0-9A-Za-z._-]{1,80}$' \
-    || [ "$active" = "." ] || [ "$active" = ".." ]; then
+  # "." and ".." pass a loose version pattern and would walk out of releases/.
+  if ! fork_version_id_safe "$active"; then
     printf 'fork-build: refusing version id %s\n' "$active" >&2
     return 1
   fi
@@ -392,12 +645,10 @@ fork_restore_backup() {
   }
   if [ ! -f "$runner" ]; then
     # cp -a copies into a directory that already exists, which would nest the
-    # backup. Drop a partial tree so the copy becomes the release directory.
-    if [ -e "$release_dir" ]; then
-      rm -rf -- "$release_dir" || {
-        printf 'fork-build: could not remove incomplete release %s\n' "$active" >&2
-        return 1
-      }
+    # backup. An incomplete tree is moved aside, not deleted: this run did
+    # not create it. A symlink at that path is a refusal.
+    if ! fork_move_incomplete_release "$active"; then
+      return 1
     fi
     mkdir -p -- "$(fork_home)/desktop-runtime/releases" || {
       printf 'fork-build: could not create the releases directory\n' >&2

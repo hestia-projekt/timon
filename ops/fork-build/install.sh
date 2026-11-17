@@ -30,6 +30,8 @@ while [ $# -gt 0 ]; do
   esac
 done
 [ -n "$PACKAGE" ] || fork_die "pass --package DIR"
+PACKAGE=$(fork_existing_dir "$PACKAGE" "package")
+fork_assert_outside_home "$PACKAGE" "package"
 [ -d "$PACKAGE/resources/orchestrator" ] || fork_die "not a runtime package: $PACKAGE"
 [ -f "$PACKAGE/fork-build.json" ] || fork_die "package has no fork-build.json"
 
@@ -49,21 +51,33 @@ printf 'active %s\n' "$ACTIVE"
 printf 'install %s\n' "$VERSION_ID"
 fork_assert_idle "$HOME_DIR" "$PORT" "$SCRIPT"
 
+if [ -L "$HOME_DIR/desktop-runtime/releases" ]; then
+  fork_die "releases directory is a symlink"
+fi
+[ -d "$HOME_DIR/desktop-runtime/releases" ] || fork_die "no releases directory"
+canon_target=$(fork_canonical_path "$TARGET")
+canon_home=$(fork_live_home_path)
+case "$canon_target" in
+  "$canon_home"/desktop-runtime/releases/"$VERSION_ID") ;;
+  *) fork_die "release path is outside the live home releases directory" ;;
+esac
+if [ -e "$TARGET" ] || [ -L "$TARGET" ]; then
+  fork_die "release already exists: $TARGET"
+fi
+
 if [ "$APPLY" -ne 1 ]; then
+  # Resolve the backup root and refuse a shared directory. Do not create it.
+  BACKUP_ROOT=$(fork_prepare_private_dir "$BACKUP_ROOT" "backup directory" check)
   printf 'dry-run: no file was written and the service was not restarted\n'
   printf 'apply: %s --package %s --apply\n' "$SCRIPT" "$PACKAGE"
   exit 0
 fi
 
-[ ! -e "$TARGET" ] || fork_die "release already exists: $TARGET"
 # 077 so a directory created here is 0700 and a file created here is 0600.
 # cp and rsync still copy the source mode; fork_privatize_tree corrects that.
+# An existing backup root is not chmodded.
 umask 077
-mkdir -p -- "$BACKUP_ROOT"
-fork_assert_outside_home "$BACKUP_ROOT" "backup directory"
-chmod 0700 "$BACKUP_ROOT" || fork_die "cannot restrict $BACKUP_ROOT"
-root_mode=$(stat -c %a -- "$BACKUP_ROOT")
-[ "$root_mode" = "700" ] || fork_die "backup root is mode $root_mode, expected 700"
+BACKUP_ROOT=$(fork_prepare_private_dir "$BACKUP_ROOT" "backup directory" create)
 
 # Stop before copying. The daemon keeps writing the home, so a second rsync
 # would never match, and a hot copy would not be the tree we can restore.
@@ -73,6 +87,8 @@ root_mode=$(stat -c %a -- "$BACKUP_ROOT")
 # unit. The unit and pointer are written back before the databases and the
 # health check, so that start runs the saved unit when a later step fails.
 phase=idle
+created_release=
+created_release_token=
 put_service_back() {
   ec=$?
   current=$phase
@@ -86,7 +102,10 @@ put_service_back() {
       printf 'restoring the previous service\n' >&2
       if ( fork_restore_backup "$DEST" ); then
         # The copy is not what the unit runs anymore. A retry can install it again.
-        rm -rf -- "$TARGET"
+        # Only the directory this run created is removed.
+        if [ -n "$created_release" ]; then
+          fork_remove_created_dir "$created_release" "$HOME_DIR/desktop-runtime/releases" "$created_release_token" || true
+        fi
       else
         systemctl --user start "$UNIT_NAME" || true
       fi
@@ -105,8 +124,13 @@ systemctl --user stop "$UNIT_NAME"
 
 STAMP=$(date -u +%Y%m%dT%H%M%SZ)
 DEST="$BACKUP_ROOT/$STAMP"
-mkdir -p -- "$DEST/db" "$DEST/home"
-chmod 0700 "$DEST" "$DEST/db" "$DEST/home" || fork_die "cannot restrict $DEST"
+if [ -e "$DEST" ] || [ -L "$DEST" ]; then
+  fork_die "backup already exists: $DEST"
+fi
+mkdir -m 0700 -- "$DEST" || fork_die "cannot create $DEST"
+mkdir -m 0700 -- "$DEST/db" "$DEST/home" || fork_die "cannot create $DEST"
+dest_mode=$(stat -c %a -- "$DEST")
+[ "$dest_mode" = "700" ] || fork_die "timestamped backup is mode $dest_mode, expected 700"
 
 FP_TIMON=$(fork_sqlite_backup "$HOME_DIR/timon.db" "$DEST/db/timon.db")
 FP_INTEGRATIONS=$(fork_sqlite_backup "$HOME_DIR/integrations.db" "$DEST/db/integrations.db")
@@ -149,7 +173,22 @@ done
 printf 'backup %s\n' "$DEST"
 phase=backed-up
 
-cp -a -- "$PACKAGE" "$TARGET"
+partial="$HOME_DIR/desktop-runtime/releases/$VERSION_ID.partial"
+if [ -e "$partial" ] || [ -L "$partial" ]; then
+  fork_die "partial release already exists: $partial"
+fi
+if ! cp -a -- "$PACKAGE" "$partial"; then
+  if [ -d "$partial" ] && [ ! -L "$partial" ]; then
+    fork_remove_created_dir "$partial" "$HOME_DIR/desktop-runtime/releases" "$(stat -c '%d:%i' -- "$partial")" || true
+  fi
+  fork_die "cannot copy the package"
+fi
+created_release_token=$(stat -c '%d:%i' -- "$partial")
+created_release=$partial
+if ! mv -T -- "$partial" "$TARGET"; then
+  fork_die "cannot install release directory"
+fi
+created_release=$TARGET
 [ -f "$TARGET/resources/orchestrator/dist/host/packaged-runner.js" ] || fork_die "copied package has no service runner"
 
 OLD_PATH="$HOME_DIR/desktop-runtime/releases/$ACTIVE"

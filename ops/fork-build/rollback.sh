@@ -25,6 +25,8 @@ while [ $# -gt 0 ]; do
   esac
 done
 [ -n "$BACKUP" ] || fork_die "pass --backup DIR"
+# Resolve the directory. Do not chmod it: a shared path is refused instead.
+BACKUP=$(fork_prepare_private_dir "$BACKUP" "backup" existing)
 [ -f "$BACKUP/manifest.json" ] || fork_die "no manifest in $BACKUP"
 
 UNIT_FILE=$(fork_unit_file)

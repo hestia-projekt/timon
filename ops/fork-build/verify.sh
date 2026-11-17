@@ -20,7 +20,8 @@ while [ $# -gt 0 ]; do
   esac
 done
 [ -n "$PACKAGE" ] || fork_die "pass --package DIR"
-[ -d "$PACKAGE" ] || fork_die "package not found: $PACKAGE"
+PACKAGE=$(fork_existing_dir "$PACKAGE" "package")
+fork_assert_outside_home "$PACKAGE" "package"
 
 ORCH="$PACKAGE/resources/orchestrator"
 NODE="$PACKAGE/resources/node/node"
@@ -28,15 +29,19 @@ RUNNER="$ORCH/dist/host/packaged-runner.js"
 [ -x "$NODE" ] || fork_die "bundled node is missing: $NODE"
 [ -f "$RUNNER" ] || fork_die "service runner is missing: $RUNNER"
 
-LIVE=$(fork_home)
-case "$PACKAGE" in
-  "$LIVE"|"$LIVE"/*) fork_die "refusing to smoke-test a package inside the live home" ;;
-esac
-
-PREP=$(cd -- "$(dirname -- "$PACKAGE")" && pwd)
+PREP=$(fork_canonical_path "$(dirname -- "$PACKAGE")")
+fork_assert_outside_home "$PREP" "preparation directory"
 SMOKE=$(mktemp -d "$PREP/smoke.XXXXXX")
-case "$SMOKE" in
-  "$LIVE"|"$LIVE"/*) rm -rf -- "$SMOKE"; fork_die "temporary home landed inside the live home" ;;
+smoke_canon=$(fork_canonical_path "$SMOKE")
+home_canon=$(fork_live_home_path)
+if [ "$smoke_canon" = "$home_canon" ]; then
+  fork_die "temporary home is the live Timon home"
+fi
+case "$smoke_canon" in
+  "$home_canon"/*)
+    rm -rf -- "$SMOKE"
+    fork_die "temporary home landed inside the live home"
+    ;;
 esac
 
 PORT=$(node -e 'const net = require("node:net"); const s = net.createServer(); s.listen(0, "127.0.0.1", () => { process.stdout.write(String(s.address().port)); s.close(); });')

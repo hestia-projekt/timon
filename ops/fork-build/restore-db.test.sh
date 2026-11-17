@@ -326,6 +326,187 @@ assert_eq "$(cat "$HOME_DIR/integrations.db-shm")" "keep-integrations" "second d
 assert_eq "$(sqlite3 "$HOME_DIR/integrations.db" "SELECT note FROM other;")" "fork-row" "second row kept"
 no_restore_leftovers
 
+# A caller-selected directory that already exists is never chmodded.
+# A shared directory (sticky and world-writable) is refused and left as it was.
+# A missing directory is created 0700. The live home is not a write target.
+shared=$ROOT_TMP/shared
+mkdir -m 1777 -- "$shared"
+printf 'keep\n' > "$shared/marker"
+shared_before=$(stat -c '%a %u %i' -- "$shared")
+
+expect_die() {
+  set +e
+  ( "$@" ) > "$ROOT_TMP/out" 2> "$ROOT_TMP/err"
+  status=$?
+  set -e
+  if [ "$status" -eq 0 ]; then
+    printf 'FAIL expected failure\n' >&2
+    cat "$ROOT_TMP/out" >&2
+    cat "$ROOT_TMP/err" >&2
+    exit 1
+  fi
+}
+
+expect_die fork_prepare_private_dir "$shared" "backup directory" create
+assert_err "mode 1777"
+assert_err "not changing it"
+assert_eq "$(stat -c '%a %u %i' -- "$shared")" "$shared_before" "shared dir unchanged"
+assert_eq "$(cat "$shared/marker")" "keep" "shared marker"
+
+ln -s "$shared" "$ROOT_TMP/shared-link"
+expect_die fork_prepare_private_dir "$ROOT_TMP/shared-link" "backup directory" create
+assert_eq "$(stat -c '%a %u %i' -- "$shared")" "$shared_before" "symlink target unchanged"
+assert_eq "$(cat "$shared/marker")" "keep" "marker after symlink"
+
+created=$shared/fork-backups
+run_ok fork_prepare_private_dir "$created" "backup directory" create
+assert_eq "$(stat -c %a -- "$created")" "700" "created backup root"
+assert_eq "$(stat -c '%a %u %i' -- "$shared")" "$shared_before" "parent unchanged"
+assert_eq "$(cat "$ROOT_TMP/out")" "$(realpath -m -- "$created")" "created path"
+
+open=$ROOT_TMP/open-root
+mkdir -m 0755 -- "$open"
+expect_die fork_prepare_private_dir "$open" "backup directory" create
+assert_err "mode 755"
+assert_eq "$(stat -c %a -- "$open")" "755" "open mode unchanged"
+
+sticky=$ROOT_TMP/sticky-root
+mkdir -m 1700 -- "$sticky"
+expect_die fork_prepare_private_dir "$sticky" "backup directory" create
+assert_err "mode 1700"
+assert_eq "$(stat -c %a -- "$sticky")" "1700" "sticky mode unchanged"
+
+mine=$ROOT_TMP/private-root
+mkdir -m 0700 -- "$mine"
+mine_before=$(stat -c '%a %i' -- "$mine")
+run_ok fork_prepare_private_dir "$mine" "backup directory" create
+assert_eq "$(stat -c '%a %i' -- "$mine")" "$mine_before" "private root untouched"
+assert_eq "$(cat "$ROOT_TMP/out")" "$(realpath -m -- "$mine")" "private path"
+
+missing=$ROOT_TMP/not-created
+run_ok fork_prepare_private_dir "$missing" "backup directory" check
+if [ -e "$missing" ]; then
+  printf 'FAIL check created %s\n' "$missing" >&2
+  exit 1
+fi
+
+expect_die fork_prepare_private_dir "$ROOT_TMP/still-missing" "backup" existing
+if [ -e "$ROOT_TMP/still-missing" ]; then
+  printf 'FAIL existing created a directory\n' >&2
+  exit 1
+fi
+
+chmod 0700 "$HOME_DIR"
+home_before=$(stat -c '%a %i' -- "$HOME_DIR")
+expect_die fork_prepare_private_dir "$HOME_DIR" "backup directory" create
+assert_err "live Timon home"
+assert_eq "$(stat -c '%a %i' -- "$HOME_DIR")" "$home_before" "home unchanged"
+expect_die fork_prepare_private_dir "$HOME_DIR/nested-backup" "backup directory" create
+if [ -e "$HOME_DIR/nested-backup" ]; then
+  printf 'FAIL created a directory inside the live home\n' >&2
+  exit 1
+fi
+
+# Restricting a tree refuses a shared root and does not chmod it.
+# A private tree this run created still has its contents tightened.
+expect_die fork_privatize_tree "$shared"
+assert_err "not changing it"
+assert_eq "$(stat -c '%a %u %i' -- "$shared")" "$shared_before" "privatize left shared dir"
+assert_eq "$(cat "$shared/marker")" "keep" "privatize left marker"
+
+priv=$ROOT_TMP/priv-tree
+mkdir -m 0700 -- "$priv"
+mkdir -m 0755 -- "$priv/sub"
+printf 'data\n' > "$priv/sub/file"
+chmod 0644 "$priv/sub/file"
+printf '#!/bin/sh\n' > "$priv/sub/run"
+chmod 0755 "$priv/sub/run"
+priv_before=$(stat -c '%a %i' -- "$priv")
+run_ok fork_privatize_tree "$priv"
+assert_eq "$(stat -c '%a %i' -- "$priv")" "$priv_before" "privatize left the root"
+assert_eq "$(stat -c %a -- "$priv/sub")" "700" "privatize directory"
+assert_eq "$(stat -c %a -- "$priv/sub/file")" "600" "privatize file"
+assert_eq "$(stat -c %a -- "$priv/sub/run")" "700" "privatize executable"
+
+# Recursive removal only for a directory this run created.
+made=$ROOT_TMP/made
+mkdir -m 0700 -- "$made"
+mkdir -m 0700 -- "$made/leaf"
+printf 'gone\n' > "$made/leaf/f"
+leaf_token=$(stat -c '%d:%i' -- "$made/leaf")
+run_ok fork_remove_created_dir "$made/leaf" "$made" "$leaf_token"
+if [ -e "$made/leaf" ]; then
+  printf 'FAIL created directory was not removed\n' >&2
+  exit 1
+fi
+if [ ! -d "$made" ]; then
+  printf 'FAIL parent was removed\n' >&2
+  exit 1
+fi
+
+expect_fail fork_remove_created_dir "$shared" "$ROOT_TMP" "0:0"
+assert_err "not the directory this run created"
+assert_eq "$(stat -c '%a %u %i' -- "$shared")" "$shared_before" "shared dir after refused remove"
+assert_eq "$(cat "$shared/marker")" "keep" "marker after refused remove"
+
+ln -s "$shared" "$made/link"
+expect_fail fork_remove_created_dir "$made/link" "$made" "0:0"
+assert_err "refusing to remove symlink"
+assert_eq "$(cat "$shared/marker")" "keep" "symlink target kept"
+if [ ! -L "$made/link" ]; then
+  printf 'FAIL symlink was removed\n' >&2
+  exit 1
+fi
+
+home_token=$(stat -c '%d:%i' -- "$HOME_DIR")
+expect_fail fork_remove_created_dir "$HOME_DIR" "$ROOT_TMP" "$home_token"
+assert_err "live Timon home"
+if [ ! -d "$HOME_DIR" ]; then
+  printf 'FAIL live home was removed\n' >&2
+  exit 1
+fi
+
+# An incomplete release is moved aside, not deleted. A symlink is refused.
+rel=$HOME_DIR/desktop-runtime/releases/0.1.8-test
+mkdir -p -- "$rel"
+printf 'official\n' > "$rel/keep"
+run_ok fork_move_incomplete_release "0.1.8-test"
+aside=$(cat "$ROOT_TMP/out")
+assert_eq "$(cat "$aside/keep")" "official" "moved bytes"
+if [ -e "$rel" ]; then
+  printf 'FAIL release path still present\n' >&2
+  exit 1
+fi
+if [ ! -d "$aside" ]; then
+  printf 'FAIL incomplete release was deleted\n' >&2
+  exit 1
+fi
+
+ln -s "$shared" "$HOME_DIR/desktop-runtime/releases/0.1.9-test"
+expect_fail fork_move_incomplete_release "0.1.9-test"
+assert_err "symlink"
+assert_eq "$(stat -c '%a %u %i' -- "$shared")" "$shared_before" "shared kept when release is a symlink"
+assert_eq "$(cat "$shared/marker")" "keep" "marker kept when release is a symlink"
+if [ ! -L "$HOME_DIR/desktop-runtime/releases/0.1.9-test" ]; then
+  printf 'FAIL symlink release was removed\n' >&2
+  exit 1
+fi
+
+expect_fail fork_move_incomplete_release ".."
+assert_err "refusing version id"
+
+link_home=$ROOT_TMP/link-home
+mkdir -m 0700 -- "$link_home"
+mkdir -m 0700 -- "$link_home/desktop-runtime"
+ln -s "$shared" "$link_home/desktop-runtime/releases"
+old_home=$TIMON_FORK_DATA_HOME
+TIMON_FORK_DATA_HOME=$link_home
+expect_fail fork_move_incomplete_release "0.1.8-test"
+TIMON_FORK_DATA_HOME=$old_home
+assert_err "symlink"
+assert_eq "$(stat -c '%a %u %i' -- "$shared")" "$shared_before" "shared kept when releases is a symlink"
+assert_eq "$(cat "$shared/marker")" "keep" "marker kept when releases is a symlink"
+
 if [ -s "$FORK_TEST_SYSTEMCTL_LOG" ]; then
   printf 'FAIL systemctl was called\n' >&2
   cat "$FORK_TEST_SYSTEMCTL_LOG" >&2

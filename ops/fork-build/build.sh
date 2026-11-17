@@ -34,8 +34,9 @@ while [ $# -gt 0 ]; do
 done
 
 REPO=$(fork_repo "$SCRIPT")
-mkdir -p -- "$PREP"
+PREP=$(fork_canonical_path "$PREP")
 fork_assert_outside_home "$PREP" "preparation directory"
+mkdir -p -- "$PREP"
 
 if [ -z "$SHELL_RELEASE" ]; then
   active=$(tr -d '[:space:]' < "$(fork_home)/desktop-runtime/active-release")
@@ -61,12 +62,16 @@ if [ -e "$OUT" ]; then
   fork_die "package already exists at $OUT (remove it to rebuild)"
 fi
 
+added_worktree=0
+added_modules_link=0
 if [ ! -d "$SRC/.git" ] && [ ! -f "$SRC/.git" ]; then
   mkdir -p -- "$(dirname -- "$SRC")"
   git -C "$REPO" worktree add --detach "$SRC" "$COMMIT"
+  added_worktree=1
 fi
 if [ ! -e "$SRC/orchestrator/node_modules" ]; then
   ln -s "$MODULES" "$SRC/orchestrator/node_modules"
+  added_modules_link=1
 fi
 
 mkdir -p -- "$KEYS" "$PREP/stage" "$PREP/out"
@@ -96,9 +101,13 @@ HASH_FILE="$PREP/out/${VERSION_ID}.sha256"
 HASH=$(sha256sum "$LIST" | awk '{print $1}')
 printf '%s  %s\n' "$HASH" "$VERSION_ID" > "$HASH_FILE"
 
-rm -rf -- "$STAGE"
-rm -f -- "$SRC/orchestrator/node_modules"
-git -C "$REPO" worktree remove --force "$SRC" || printf 'fork-build: checkout left at %s\n' "$SRC" >&2
+fork_remove_script_stage "$STAGE" "$PREP/stage" "$VERSION_ID"
+if [ "$added_modules_link" -eq 1 ]; then
+  rm -f -- "$SRC/orchestrator/node_modules"
+fi
+if [ "$added_worktree" -eq 1 ]; then
+  git -C "$REPO" worktree remove --force "$SRC" || printf 'fork-build: checkout left at %s\n' "$SRC" >&2
+fi
 printf 'package %s\n' "$OUT"
 printf 'content-sha256 %s\n' "$HASH"
 printf 'commit %s\n' "$COMMIT"

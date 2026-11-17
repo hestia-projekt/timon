@@ -19,7 +19,7 @@ Deux origines :
 
 `fork-build.json` à la racine du paquet dit quel commit et quelle coque ont servi. Le nom du répertoire est `<version-amont>-fork.<sha court de 12 caractères>`.
 
-Le build n'écrit pas dans `~/.timon` et ne lance pas `npm`. Il se prépare dans `~/timon-fork-prep` (ou `TIMON_FORK_PREP`).
+Le build n'écrit pas dans `~/.timon` et ne lance pas `npm`. Il se prépare dans `~/timon-fork-prep` (ou `TIMON_FORK_PREP`, ou `--prep`). Ce chemin est canonique (les liens sont suivis) avant toute création. `~/.timon` lui-même, ou un chemin qui s'y trouve, est refusé. Un répertoire de préparation déjà présent n'est pas modifié.
 
 ## Build
 
@@ -55,10 +55,10 @@ ops/fork-build/install.sh --package ~/timon-fork-prep/out/<id> --apply
 Avec `--apply`, dans l'ordre :
 
 1. Il refuse si `GET /api/missions?status=running` n'est pas vide, ou s'il ne peut pas le lire. Le jeton du démon est lu dans le fichier, jamais affiché. Une page pleine (1000 lignes) est aussi un refus : la liste serait tronquée. Sans `--apply`, le script s'arrête ici.
-2. Il prépare le dossier racine de sauvegarde (`0700`), hors de `~/.timon`.
+2. Il prépare le dossier racine de sauvegarde, hors de `~/.timon`. Le chemin (`--backup-root` ou `TIMON_FORK_BACKUP_ROOT`) est canonique. `~/.timon` lui-même est refusé. S'il n'existe pas, le script le crée en `0700` ; les parents déjà présents ne sont pas modifiés. S'il existe, le script ne change pas ses droits : il l'accepte seulement s'il appartient à l'utilisateur courant et est déjà en `0700`, sinon il s'arrête.
 3. Il relit la liste des missions, et c'est la dernière action avant l'arrêt. Une mission apparue depuis le premier contrôle, ou une liste illisible, est un refus : l'unité en marche n'est pas arrêtée.
 4. Il arrête l'unité. La copie qui suit ne bouge plus. Si une étape échoue avant la bascule, l'unité précédente est relancée. Après la bascule, un échec déclenche le retour arrière.
-5. Il écrit une sauvegarde horodatée dans `~/timon-fork-backups/<date>/` (ou `TIMON_FORK_BACKUP_ROOT`). Le dossier racine est en `0700`. Les fichiers sont en `0600` ; un exécutable copié reste exécutable par le propriétaire seul (`0700`), pour que le retour arrière puisse lancer le binaire. Le script vérifie ces droits après la copie :
+5. Il écrit une sauvegarde horodatée dans `~/timon-fork-backups/<date>/` (ou sous `TIMON_FORK_BACKUP_ROOT`). Ce sous-dossier est créé en `0700` par le script. La racine, si elle existait déjà, garde ses droits. Les fichiers sont en `0600` ; un exécutable copié reste exécutable par le propriétaire seul (`0700`), pour que le retour arrière puisse lancer le binaire. Le script vérifie ces droits après la copie :
    - `timon.db` et `integrations.db` par `sqlite3 .backup`, puis `PRAGMA integrity_check` ;
    - le reste du dossier, sauf le runtime, les worktrees, les caches et les bases (une copie à chaud du fichier SQLite n'est pas utilisée) ; un second `rsync` à blanc doit être vide ;
    - une copie de la release officielle courante, vérifiée par le SHA-256 de `release-manifest.json` et le nombre de fichiers ;
@@ -94,11 +94,13 @@ ops/fork-build/rollback.sh --backup ~/timon-fork-backups/<date>
 ops/fork-build/rollback.sh --backup ~/timon-fork-backups/<date> --apply
 ```
 
+`--backup` est canonique. Le dossier est refusé s'il est `~/.timon`, s'il s'y trouve, s'il n'appartient pas à l'utilisateur courant, ou s'il n'est pas déjà en `0700`. Le script ne change pas ses droits.
+
 Avec `--apply` : si le démon répond, le script refuse tant qu'une mission tourne. Il relit la liste une seconde fois, juste avant l'arrêt (voir [Bascule](#bascule)). La restauration suit cet ordre :
 
 1. Arrêt de l'unité, après ce second contrôle quand le port répond encore.
 2. Remise du fichier d'unité et du pointeur `active-release` sauvegardés.
-3. Lecture de `activeRelease` dans `manifest.json`. Si `desktop-runtime/releases/<activeRelease>/resources/orchestrator/dist/host/packaged-runner.js` est absent, copie de `official-release` vers ce répertoire (un répertoire incomplet est retiré avant, pour que la copie porte le nom de la release), puis vérification du SHA-256 de `release-manifest.json`.
+3. Lecture de `activeRelease` dans `manifest.json`. Si `desktop-runtime/releases/<activeRelease>/resources/orchestrator/dist/host/packaged-runner.js` est absent, un répertoire incomplet à ce chemin est déplacé à côté (`<id>.incomplete`), pas supprimé : le script ne fait de suppression récursive que sur un répertoire qu'il vient de créer. La copie de `official-release` prend ensuite ce nom, puis le SHA-256 de `release-manifest.json` est vérifié. Un lien symbolique à la place de la release est un refus.
 4. Rechargement de systemd (`daemon-reload`).
 5. Restauration de `timon.db`, puis de `integrations.db`. Une base n'est ignorée que si son empreinte sauvegardée vaut `absent` : le fichier n'existait pas avant la bascule.
    - Empreinte `absent` : la copie n'est pas remise. Un fichier apparu depuis (la release qui a échoué l'a créé), ainsi que ses `-wal` et `-shm`, est supprimé, y compris quand il ne reste que le journal. Il n'existe pas de schéma sauvegardé auquel le comparer ; le démon officiel retrouve l'absence d'avant et recrée le fichier s'il en a besoin. Les écritures faites dans ce fichier après la bascule sont perdues.

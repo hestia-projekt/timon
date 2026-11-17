@@ -20,7 +20,7 @@
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { cpSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
-import { basename, isAbsolute, join, relative, resolve } from 'node:path';
+import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
 const USAGE = `Usage: node ops/fork-build/assemble-release.mjs --checkout DIR --stage DIR --output DIR --shell DIR --key-dir DIR --version-id ID --commit SHA --modules DIR`;
@@ -53,6 +53,17 @@ function assertOutside(path, home, what) {
   const rel = relative(parent, child);
   if (rel === '' || (!rel.startsWith('..') && !isAbsolute(rel))) {
     throw new Error(`${what} is inside ${parent}: refusing to build where the daemon runs`);
+  }
+}
+
+// The stage is scratch this build creates. Only <somewhere>/stage/<version>
+// may be removed, and never a symlink (that would be a caller-chosen path).
+function assertRemovableStage(stagePath, versionId) {
+  if (versionId === '.' || versionId === '..' || basename(stagePath) !== versionId || basename(dirname(stagePath)) !== 'stage') {
+    throw new Error(`refusing to remove stage path ${stagePath}`);
+  }
+  if (existsSync(stagePath) && lstatSync(stagePath).isSymbolicLink()) {
+    throw new Error(`refusing to remove symlink stage ${stagePath}`);
   }
 }
 
@@ -261,6 +272,7 @@ const prepare = await importer('desktop/scripts/prepare-daemon-release.mjs');
 const buildInfoMod = await importer('desktop/scripts/build-info.mjs');
 const integrity = await importer('desktop/scripts/release-integrity.mjs');
 
+assertRemovableStage(stage, opt.versionId);
 rmSync(stage, { recursive: true, force: true });
 mkdirSync(stage, { recursive: true });
 const tsc = join(modules, 'typescript', 'bin', 'tsc');
