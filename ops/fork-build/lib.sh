@@ -75,25 +75,103 @@ fork_sqlite_backup() {
     printf 'absent\n'
     return 0
   fi
+  # sqlite3 creates the copy with the process umask. 022 would leave a 0644
+  # database that other accounts on the machine can read.
+  umask 077
   sqlite3 "$src" ".backup '$dest'"
+  chmod 0600 "$dest" || fork_die "cannot restrict backup of $(basename "$src")"
+  mode=$(stat -c %a -- "$dest")
+  [ "$mode" = "600" ] || fork_die "backup of $(basename "$src") is mode $mode, expected 600"
   check=$(sqlite3 "$dest" "PRAGMA integrity_check;")
   [ "$check" = "ok" ] || fork_die "backup of $(basename "$src") failed integrity_check"
   fork_schema_fingerprint "$dest"
 }
 
+# Drop group and other access on a backup tree. New files are already 0600
+# under umask 077, but cp -a and rsync -a keep the source mode, so a copied
+# database or a copied release would stay 0644/0755. Directories become 0700.
+# A file that was executable stays owner-executable (0700): rollback runs the
+# saved node binary. Every other file becomes 0600. Then the modes are read
+# back and a group or other bit is a failure.
+fork_privatize_tree() {
+  root=$1
+  [ -d "$root" ] || fork_die "cannot restrict $root"
+  chmod 0700 "$root" || fork_die "cannot restrict $root"
+  find "$root" -type d -exec chmod 0700 {} + || fork_die "cannot restrict directories under $root"
+  find "$root" -type f -perm /111 -exec chmod 0700 {} + || fork_die "cannot restrict executables under $root"
+  find "$root" -type f ! -perm /111 -exec chmod 0600 {} + || fork_die "cannot restrict files under $root"
+  bad=$(find "$root" \( \( -type d ! -perm 0700 \) -o \( -type f -perm /077 \) \) -print | head -n 5)
+  [ -z "$bad" ] || fork_die "backup is readable by group or other: $bad"
+}
+
+# TIMON_HOME as the unit file records it. The daemon hashes that string.
+fork_unit_home() {
+  found=$(sed -n 's/^Environment="TIMON_HOME=\([^"]*\)".*/\1/p' "$1" | head -n 1)
+  if [ -n "$found" ]; then
+    printf '%s\n' "$found"
+  else
+    fork_home
+  fi
+}
+
+# Same derivation as instanceId() in orchestrator/src/host/packaged-service.ts:
+# sha256(path.resolve(home)) hex, first 24 characters. resolve() does not
+# follow symlinks; do not realpath the home here.
+fork_instance_id() {
+  node --input-type=module -e 'import { createHash } from "node:crypto"; import { resolve } from "node:path"; const home = process.argv[1]; if (!home) process.exit(1); process.stdout.write(createHash("sha256").update(resolve(home)).digest("hex").slice(0, 24));' "$1"
+}
+
+# Exit 0 when the body is this home's booted daemon, 2 when it is not ready
+# yet, 3 when it is a booted Timon with no instance field, 4 when the instance
+# is some other home. stdin is the raw /api/health body.
+fork_classify_health() {
+  node --input-type=module -e 'let raw = ""; for await (const chunk of process.stdin) raw += chunk; let body; try { body = JSON.parse(raw); } catch { process.exit(2); } if (!body || typeof body !== "object") process.exit(2); const expected = process.argv[1]; if (typeof body.instance === "string" && body.instance !== expected) process.exit(4); if (body.ok !== true || body.service !== "timon" || body.status === "update_pending") process.exit(2); if (typeof body.instance !== "string") process.exit(3); process.exit(0);' "$1"
+}
+
+# Exit 0 when a process listening on the port is inside the unit cgroup.
+fork_listener_in_unit() {
+  port=$1
+  unit=$2
+  cgroup=$(systemctl --user show -p ControlGroup --value -- "$unit" 2>/dev/null || true)
+  [ -n "$cgroup" ] || return 1
+  node --input-type=module -e 'import { readdirSync, readFileSync, readlinkSync } from "node:fs"; import { join } from "node:path"; const port = Number(process.argv[1]); const cgroup = process.argv[2]; if (!Number.isInteger(port) || port <= 0 || !cgroup) process.exit(1); const inodes = new Set(); for (const file of ["/proc/net/tcp", "/proc/net/tcp6"]) { let text; try { text = readFileSync(file, "utf8"); } catch { continue; } for (const line of text.trim().split("\n").slice(1)) { const parts = line.trim().split(/\s+/); if (parts[3] !== "0A") continue; const localPort = Number.parseInt(parts[1].split(":").pop(), 16); if (localPort === port) inodes.add(parts[9]); } } if (inodes.size === 0) process.exit(1); for (const pid of readdirSync("/proc")) { if (!/^[0-9]+$/.test(pid)) continue; let fds; try { fds = readdirSync(join("/proc", pid, "fd")); } catch { continue; } for (const fd of fds) { let target; try { target = readlinkSync(join("/proc", pid, "fd", fd)); } catch { continue; } const match = /^socket:\[([0-9]+)\]$/.exec(target); if (!match || !inodes.has(match[1])) continue; let group = ""; try { group = readFileSync(join("/proc", pid, "cgroup"), "utf8"); } catch { continue; } if (group.includes(cgroup)) process.exit(0); } } process.exit(1);' "$port" "$cgroup"
+}
+
+# fork_health PORT [TRIES] [HOME] [UNIT]
+# HOME is the data directory the launched daemon was given (TIMON_HOME). It
+# defaults to the installation home. UNIT, when set, is the systemd unit that
+# was just started: a health body with no instance field is accepted only when
+# the listener belongs to that unit. A different instance fails at once so the
+# caller rolls back instead of treating another Timon on this port as success.
 fork_health() {
   port=$1
   tries=${2:-60}
+  home=${3:-$(fork_home)}
+  unit=${4:-}
+  expected=$(fork_instance_id "$home")
   i=0
   while [ "$i" -lt "$tries" ]; do
     if body=$(curl -fsS --max-time 3 "http://127.0.0.1:${port}/api/health" 2>/dev/null); then
-      # A daemon waiting on data-update approval also answers ok:true. That is
-      # not a booted service: the switch must roll back instead of staying there.
-      if printf '%s' "$body" | grep -Eq '"ok"[[:space:]]*:[[:space:]]*true' \
-        && printf '%s' "$body" | grep -Eq '"service"[[:space:]]*:[[:space:]]*"timon"' \
-        && ! printf '%s' "$body" | grep -Eq '"status"[[:space:]]*:[[:space:]]*"update_pending"'; then
+      code=0
+      printf '%s' "$body" | fork_classify_health "$expected" || code=$?
+      if [ "$code" -eq 0 ]; then
         printf '%s\n' "$body"
         return 0
+      fi
+      # Another home already holds the port. Waiting will not make it ours.
+      if [ "$code" -eq 4 ]; then
+        printf 'fork-build: health on port %s is another Timon instance\n' "$port" >&2
+        return 1
+      fi
+      # A booted Timon that does not name an instance: accept it only when the
+      # process listening is the unit this script started.
+      if [ "$code" -eq 3 ]; then
+        if [ -n "$unit" ] && fork_listener_in_unit "$port" "$unit"; then
+          printf '%s\n' "$body"
+          return 0
+        fi
+        printf 'fork-build: health on port %s has no instance and is not unit %s\n' "$port" "$unit" >&2
+        return 1
       fi
     fi
     i=$((i + 1))
@@ -233,7 +311,8 @@ fork_restore_backup() {
     printf 'fork-build: could not start %s\n' "$unit" >&2
     return 1
   }
-  if ! fork_health "$port" 60 >/dev/null; then
+  restored_home=$(fork_unit_home "$unit_file")
+  if ! fork_health "$port" 60 "$restored_home" "$unit" >/dev/null; then
     printf 'fork-build: restored service did not answer on port %s; backup left at %s\n' "$port" "$dest" >&2
     return 1
   fi

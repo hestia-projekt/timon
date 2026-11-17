@@ -15,7 +15,7 @@ Le répertoire produit a la même forme que `releases/<version>/` : binaire Elec
 Deux origines :
 
 - **Démon**, compilé depuis le commit demandé : `dist`, `bin`, `presets`, `scripts`, plugins intégrés, documentation exportée, lanceur `timon-fence`. Il est signé avec une clé Ed25519 créée pour ce build (`~/timon-fork-prep/keys/<id>/`). La clé publique est écrite dans `dist/boot.js`, donc le paquet vérifie son propre inventaire. Ce n'est pas la clé de publication amont.
-- **Coque**, copiée depuis la release officielle du même numéro de version : Electron, Node livré, application web, et `node_modules` du démon (modules natifs déjà compilés pour ce Node). Le script refuse de continuer si les dépendances npm du commit ne sont plus celles de cette coque.
+- **Coque**, copiée depuis la release officielle du même numéro de version : Electron, Node livré, application web, et `node_modules` du démon (modules natifs déjà compilés pour ce Node). Le script refuse une coque dont la version (`package.json` scellé par `release-manifest.json`, et le nom du répertoire, qui est l'identifiant officiel de cette version) n'est pas celle du commit. Il refuse aussi quand l'arbre résolu des dépendances diffère : l'empreinte de `node_modules` (version, et intégrité quand `node_modules/.package-lock.json` la donne) est comparée à `orchestrator/package-lock.json` du commit, pas seulement à la map `dependencies`.
 
 `fork-build.json` à la racine du paquet dit quel commit et quelle coque ont servi. Le nom du répertoire est `<version-amont>-fork.<sha court de 12 caractères>`.
 
@@ -31,7 +31,7 @@ systemd-run --user --wait --collect \
   -- ops/fork-build/build.sh --commit <sha>
 ```
 
-`--commit` accepte un SHA ou une réf. Sans argument, c'est `HEAD`. `--shell` nomme une autre release officielle à copier ; par défaut c'est le répertoire pointé par `active-release`.
+`--commit` accepte un SHA ou une réf. Sans argument, c'est `HEAD`. `--shell` nomme une autre release officielle du même numéro de version ; par défaut c'est le répertoire pointé par `active-release`.
 
 À la fin, le script affiche le chemin du paquet et un SHA-256. Ce condensé est celui de la liste triée des SHA-256 de chaque fichier (`<préparation>/out/<id>.files.sha256`), pas un tar. Le fichier `<id>.sha256` à côté du paquet reprend ce condensé.
 
@@ -41,7 +41,7 @@ systemd-run --user --wait --collect \
 ops/fork-build/verify.sh --package ~/timon-fork-prep/out/<id>
 ```
 
-Le script démarre le paquet avec un `TIMON_HOME` temporaire sous le répertoire de préparation, un port libre, et `TIMON_APP_ENABLED=0`. Il lit `GET /api/health` et n'accepte que `{ "ok": true, "service": "timon" }` sans `status: "update_pending"` (un démon qui attend une approbation de migration n'est pas en service). Il importe `PLUGIN_PERMISSIONS` depuis le `dist` produit, exige `approvals:read` et `approvals:resolve`, puis arrête l'unité transitoire. Rien n'est ouvert sous le `~/.timon` réel.
+Le script démarre le paquet avec un `TIMON_HOME` temporaire sous le répertoire de préparation, un port libre, et `TIMON_APP_ENABLED=0`. Il lit `GET /api/health` et n'accepte que `{ "ok": true, "service": "timon" }` dont `instance` est celle de ce home (les 24 premiers caractères hexadécimaux du SHA-256 du chemin, comme `instanceId` du démon), sans `status: "update_pending"` (un démon qui attend une approbation de migration n'est pas en service). Une autre instance Timon sur le même port est un échec. Si la réponse n'a pas d'`instance`, le processus qui écoute doit appartenir à l'unité lancée. Il importe `PLUGIN_PERMISSIONS` depuis le `dist` produit, exige `approvals:read` et `approvals:resolve`, puis arrête l'unité transitoire. Rien n'est ouvert sous le `~/.timon` réel.
 
 ## Installation
 
@@ -56,13 +56,13 @@ Avec `--apply`, dans l'ordre :
 
 1. Il refuse si `GET /api/missions?status=running` n'est pas vide, ou s'il ne peut pas le lire. Le jeton du démon est lu dans le fichier, jamais affiché. Une page pleine (1000 lignes) est aussi un refus : la liste serait tronquée.
 2. Il arrête l'unité. La copie qui suit ne bouge plus. Si une étape échoue avant la bascule, l'unité précédente est relancée. Après la bascule, un échec déclenche le retour arrière.
-3. Il écrit une sauvegarde horodatée dans `~/timon-fork-backups/<date>/` (ou `TIMON_FORK_BACKUP_ROOT`), hors de `~/.timon` :
+3. Il écrit une sauvegarde horodatée dans `~/timon-fork-backups/<date>/` (ou `TIMON_FORK_BACKUP_ROOT`), hors de `~/.timon`. Le dossier racine est en `0700`. Les fichiers sont en `0600` ; un exécutable copié reste exécutable par le propriétaire seul (`0700`), pour que le retour arrière puisse lancer le binaire. Le script vérifie ces droits après la copie :
    - `timon.db` et `integrations.db` par `sqlite3 .backup`, puis `PRAGMA integrity_check` ;
    - le reste du dossier, sauf le runtime, les worktrees, les caches et les bases (une copie à chaud du fichier SQLite n'est pas utilisée) ; un second `rsync` à blanc doit être vide ;
    - une copie de la release officielle courante, vérifiée par le SHA-256 de `release-manifest.json` et le nombre de fichiers ;
    - l'unité systemd et le pointeur `active-release` tels qu'ils étaient.
 4. Il copie le paquet dans `desktop-runtime/releases/<id>/`, réécrit les chemins de l'unité (les drop-ins, dont le port de l'application, ne sont pas touchés), pose le pointeur, recharge systemd et redémarre l'unité.
-5. Il attend `/api/health` (`service` vaut `timon`, pas d'attente d'approbation). Si le redémarrage ou la santé échoue, il exécute le retour arrière décrit plus bas, puis retire la copie du paquet. Si ce retour arrière échoue à son tour, l'unité dont les fichiers viennent d'être remis est tout de même relancée.
+5. Il attend `/api/health` (`instance` est celle du home visé, `service` vaut `timon`, pas d'attente d'approbation). Une autre instance sur le port est un échec. Si le redémarrage ou la santé échoue, il exécute le retour arrière décrit plus bas, puis retire la copie du paquet. Si ce retour arrière échoue à son tour, l'unité dont les fichiers viennent d'être remis est tout de même relancée.
 
 La bascule ne passe pas par `timon update apply`.
 
@@ -99,7 +99,7 @@ Pour chaque release amont :
 
 1. `git fetch upstream` et partir de `upstream/main` (ou de l'étiquette de la release).
 2. Rejouer les commits propres au fork (`git rebase --onto upstream/main <ancienne-base> <branche-du-fork>`). Les fichiers de `ops/fork-build/` ne touchent pas le code amont : ils se rejouent tels quels. Un conflit dans le démon se résout avant le build, jamais en forçant.
-3. Relancer le build sur le nouveau SHA, avec `--shell` pointant la release officielle qui correspond au numéro de version, une fois qu'elle est installée dans `desktop-runtime/releases/`. Si `orchestrator/package.json` a de nouvelles dépendances, le build s'arrête : les modules natifs de l'ancienne coque ne conviennent plus.
+3. Relancer le build sur le nouveau SHA, avec `--shell` pointant la release officielle qui correspond au numéro de version, une fois qu'elle est installée dans `desktop-runtime/releases/`. Si la version, la map `dependencies` ou l'arbre résolu du lock diffère de cette coque, le build s'arrête : les modules natifs de l'ancienne coque ne conviennent plus.
 4. `verify.sh`, puis `install.sh --apply` quand aucune mission ne tourne. L'install prend une nouvelle sauvegarde.
 
 ## Mises à jour signées une fois le fork en service

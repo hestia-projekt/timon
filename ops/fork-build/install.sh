@@ -54,8 +54,14 @@ if [ "$APPLY" -ne 1 ]; then
 fi
 
 [ ! -e "$TARGET" ] || fork_die "release already exists: $TARGET"
+# 077 so a directory created here is 0700 and a file created here is 0600.
+# cp and rsync still copy the source mode; fork_privatize_tree corrects that.
+umask 077
 mkdir -p -- "$BACKUP_ROOT"
 fork_assert_outside_home "$BACKUP_ROOT" "backup directory"
+chmod 0700 "$BACKUP_ROOT" || fork_die "cannot restrict $BACKUP_ROOT"
+root_mode=$(stat -c %a -- "$BACKUP_ROOT")
+[ "$root_mode" = "700" ] || fork_die "backup root is mode $root_mode, expected 700"
 
 # Stop before copying. The daemon keeps writing the home, so a second rsync
 # would never match, and a hot copy would not be the tree we can restore.
@@ -93,6 +99,7 @@ systemctl --user stop "$UNIT_NAME"
 STAMP=$(date -u +%Y%m%dT%H%M%SZ)
 DEST="$BACKUP_ROOT/$STAMP"
 mkdir -p -- "$DEST/db" "$DEST/home"
+chmod 0700 "$DEST" "$DEST/db" "$DEST/home" || fork_die "cannot restrict $DEST"
 
 FP_TIMON=$(fork_sqlite_backup "$HOME_DIR/timon.db" "$DEST/db/timon.db")
 FP_INTEGRATIONS=$(fork_sqlite_backup "$HOME_DIR/integrations.db" "$DEST/db/integrations.db")
@@ -125,6 +132,13 @@ jq -n \
   --arg integrations "$FP_INTEGRATIONS" \
   '{stamp: $stamp, unit: $unit, port: $port, activeRelease: $active, packageVersionId: $package, databases: {"timon.db": {fingerprint: $timon}, "integrations.db": {fingerprint: $integrations}}}' \
   > "$DEST/manifest.json"
+fork_privatize_tree "$DEST"
+for db_name in timon.db integrations.db; do
+  db_copy="$DEST/db/$db_name"
+  [ -f "$db_copy" ] || continue
+  db_mode=$(stat -c %a -- "$db_copy")
+  [ "$db_mode" = "600" ] || fork_die "backup of $db_name is mode $db_mode, expected 600"
+done
 printf 'backup %s\n' "$DEST"
 phase=backed-up
 
@@ -152,7 +166,8 @@ node --input-type=module -e '
 printf '%s\n' "$VERSION_ID" > "$HOME_DIR/desktop-runtime/active-release"
 systemctl --user daemon-reload
 systemctl --user restart "$UNIT_NAME"
-fork_health "$PORT" 60 >/dev/null
+UNIT_HOME=$(fork_unit_home "$UNIT_FILE")
+fork_health "$PORT" 60 "$UNIT_HOME" "$UNIT_NAME" >/dev/null
 phase="done"
 printf 'active-release %s\n' "$VERSION_ID"
 printf 'rollback: %s --backup %s --apply\n' "$(fork_script_dir "$SCRIPT")/rollback.sh" "$DEST"

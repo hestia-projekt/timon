@@ -26,12 +26,14 @@ done
 [ -f "$BACKUP/manifest.json" ] || fork_die "no manifest in $BACKUP"
 
 UNIT_FILE=$(fork_unit_file)
+UNIT_NAME=$(fork_unit_name)
+UNIT_HOME=$(fork_unit_home "$UNIT_FILE")
 PORT=$(jq -r '.port' "$BACKUP/manifest.json")
 ACTIVE=$(jq -r '.activeRelease' "$BACKUP/manifest.json")
 printf 'restore-release %s\n' "$ACTIVE"
 printf 'backup %s\n' "$BACKUP"
 
-if fork_health "$PORT" 1 >/dev/null 2>&1; then
+if fork_health "$PORT" 1 "$UNIT_HOME" "$UNIT_NAME" >/dev/null; then
   fork_assert_idle "$(fork_home)" "$PORT" "$SCRIPT"
 else
   printf 'daemon is not answering; rollback continues\n'

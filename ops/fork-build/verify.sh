@@ -74,7 +74,7 @@ systemd-run --user --collect --unit="$UNIT" \
 printf 'smoke-home %s\n' "$SMOKE"
 printf 'port %s\n' "$PORT"
 
-if ! HEALTH=$(fork_health "$PORT" 60); then
+if ! HEALTH=$(fork_health "$PORT" 60 "$SMOKE" "$UNIT"); then
   KEEP_SMOKE=1
   printf 'health failed; log follows\n' >&2
   tail -n 40 "$LOG" >&2 || true
