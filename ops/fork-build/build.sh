@@ -69,6 +69,19 @@ KEYS=$(fork_confine "$keys_want" "$PREP" "keys")
 [ "$SRC" = "$src_want" ] || fork_die "checkout leaves the preparation root ($SRC)"
 [ "$KEYS" = "$keys_want" ] || fork_die "keys leave the preparation root ($KEYS)"
 
+# A file symlink planted before this run is refused here, before a worktree
+# or a key is created. The write is checked again immediately before it happens.
+if [ -e "$PREP/out" ] || [ -L "$PREP/out" ]; then
+  out_dir=$(fork_confine "$PREP/out" "$PREP" "output directory") || exit 1
+  [ "$out_dir" = "$PREP/out" ] || fork_die "output directory leaves the preparation root ($out_dir)"
+  fork_confine_file "$out_dir/${VERSION_ID}.files.sha256" "$out_dir" "file list" >/dev/null || exit 1
+  fork_confine_file "$out_dir/${VERSION_ID}.sha256" "$out_dir" "content hash" >/dev/null || exit 1
+fi
+if [ -e "$KEYS" ] || [ -L "$KEYS" ]; then
+  fork_confine_file "$KEYS/fork-release.key.pem" "$KEYS" "release key" >/dev/null || exit 1
+  fork_confine_file "$KEYS/fork-release.pub.pem" "$KEYS" "release public key" >/dev/null || exit 1
+fi
+
 if [ -e "$OUT" ]; then
   fork_die "package already exists at $OUT (remove it to rebuild)"
 fi
@@ -85,13 +98,15 @@ if [ ! -e "$SRC/orchestrator/node_modules" ]; then
   added_modules_link=1
 fi
 
+for planted in "$KEYS" "$PREP/stage" "$PREP/out"; do
+  if [ -L "$planted" ]; then
+    fork_die "refusing to follow symlink $planted"
+  fi
+done
 mkdir -p -- "$KEYS" "$PREP/stage" "$PREP/out"
-if [ ! -f "$KEYS/fork-release.key.pem" ]; then
-  umask 077
-  openssl genpkey -algorithm ED25519 -out "$KEYS/fork-release.key.pem"
-  openssl pkey -in "$KEYS/fork-release.key.pem" -pubout -out "$KEYS/fork-release.pub.pem"
-  umask 022
-fi
+KEYS=$(fork_confine "$keys_want" "$PREP" "keys") || exit 1
+[ "$KEYS" = "$keys_want" ] || fork_die "keys leave the preparation root ($KEYS)"
+fork_ensure_release_keys "$KEYS" || exit 1
 
 node "$REPO/ops/fork-build/assemble-release.mjs" \
   --checkout "$SRC" \
@@ -103,13 +118,17 @@ node "$REPO/ops/fork-build/assemble-release.mjs" \
   --commit "$COMMIT" \
   --modules "$MODULES"
 
-LIST="$PREP/out/${VERSION_ID}.files.sha256"
-HASH_FILE="$PREP/out/${VERSION_ID}.sha256"
+out_dir=$(fork_confine "$PREP/out" "$PREP" "output directory") || exit 1
+[ "$out_dir" = "$PREP/out" ] || fork_die "output directory leaves the preparation root ($out_dir)"
+OUT=$(fork_confine "$out_want" "$PREP" "output") || exit 1
+[ "$OUT" = "$out_want" ] || fork_die "output leaves the preparation root ($OUT)"
+LIST=$(fork_confine_file "$out_dir/${VERSION_ID}.files.sha256" "$out_dir" "file list") || exit 1
 (
   cd -- "$OUT"
   find . -type f -print0 | sort -z | xargs -0 -r sha256sum
 ) > "$LIST"
 HASH=$(sha256sum "$LIST" | awk '{print $1}')
+HASH_FILE=$(fork_confine_file "$out_dir/${VERSION_ID}.sha256" "$out_dir" "content hash") || exit 1
 printf '%s  %s\n' "$HASH" "$VERSION_ID" > "$HASH_FILE"
 
 fork_remove_script_stage "$STAGE" "$PREP/stage" "$VERSION_ID"

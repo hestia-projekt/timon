@@ -681,6 +681,185 @@ expect_die fork_privatize_tree "$priv_link/alias/sub"
 assert_err "inside the live Timon home"
 assert_eq "$(stat -c %a -- "$FAKE_HOME/sub/file")" "644" "privatize left file"
 assert_eq "$(stat -c %a -- "$FAKE_HOME/sub")" "755" "privatize left directory"
+
+# A planted file symlink is not a write target. Redirection and openssl -out
+# would follow it, and [ ! -f ] is true when the link is dangling.
+file_dir=$ROOT_TMP/file-confine
+mkdir -p "$file_dir"
+printf 'keep-file\n' > "$ROOT_TMP/file-victim"
+ln -s "$ROOT_TMP/file-victim" "$file_dir/list"
+file_inode=$(stat -c %i -- "$ROOT_TMP/file-victim")
+expect_die fork_confine_file "$file_dir/list" "$file_dir" "file list"
+assert_err "refusing to follow symlink"
+assert_eq "$(cat "$ROOT_TMP/file-victim")" "keep-file" "file symlink victim"
+assert_eq "$(stat -c %i -- "$ROOT_TMP/file-victim")" "$file_inode" "file symlink inode"
+if [ ! -L "$file_dir/list" ]; then
+  printf 'FAIL planted file symlink was replaced\n' >&2
+  exit 1
+fi
+
+dangling_target=$ROOT_TMP/dangling-target
+ln -s "$dangling_target" "$file_dir/dangling"
+expect_die fork_confine_file "$file_dir/dangling" "$file_dir" "file list"
+assert_err "refusing to follow symlink"
+if [ -e "$dangling_target" ] || [ -L "$dangling_target" ]; then
+  printf 'FAIL dangling symlink target was created\n' >&2
+  exit 1
+fi
+
+mkdir -p "$file_dir/not-a-file"
+expect_die fork_confine_file "$file_dir/not-a-file" "$file_dir" "file list"
+assert_err "not a regular file"
+if [ ! -d "$file_dir/not-a-file" ]; then
+  printf 'FAIL directory leaf was removed\n' >&2
+  exit 1
+fi
+
+ln -s "$file_dir" "$ROOT_TMP/parent-link"
+expect_die fork_confine_file "$ROOT_TMP/parent-link/new" "$ROOT_TMP/parent-link" "file list"
+assert_err "parent is a symlink"
+if [ -e "$file_dir/new" ]; then
+  printf 'FAIL symlink parent was written\n' >&2
+  exit 1
+fi
+
+expect_die fork_confine_file "$file_dir/../outside-file" "$file_dir" "file list"
+assert_err "leaves its confined parent"
+if [ -e "$ROOT_TMP/outside-file" ]; then
+  printf 'FAIL escaped path was created\n' >&2
+  exit 1
+fi
+
+run_ok fork_confine_file "$file_dir/missing" "$file_dir" "file list"
+assert_eq "$(cat "$ROOT_TMP/out")" "$(realpath -m -- "$file_dir/missing")" "missing file path"
+if [ -e "$file_dir/missing" ]; then
+  printf 'FAIL confine created the file\n' >&2
+  exit 1
+fi
+printf 'regular\n' > "$file_dir/regular"
+run_ok fork_confine_file "$file_dir/regular" "$file_dir" "file list"
+assert_eq "$(cat "$ROOT_TMP/out")" "$(realpath -m -- "$file_dir/regular")" "regular file path"
+assert_eq "$(cat "$file_dir/regular")" "regular" "regular file untouched"
+
+key_dir=$ROOT_TMP/keys-dangling
+mkdir -m 0700 "$key_dir"
+key_target=$ROOT_TMP/key-target
+ln -s "$key_target" "$key_dir/fork-release.key.pem"
+expect_die fork_ensure_release_keys "$key_dir"
+assert_err "refusing to follow symlink"
+if [ -e "$key_target" ] || [ -L "$key_target" ]; then
+  printf 'FAIL private key was written through a dangling symlink\n' >&2
+  exit 1
+fi
+if [ ! -L "$key_dir/fork-release.key.pem" ]; then
+  printf 'FAIL key symlink was replaced\n' >&2
+  exit 1
+fi
+
+key_dir=$ROOT_TMP/keys-victim
+mkdir -m 0700 "$key_dir"
+printf 'not-a-key\n' > "$ROOT_TMP/key-victim"
+key_inode=$(stat -c %i -- "$ROOT_TMP/key-victim")
+ln -s "$ROOT_TMP/key-victim" "$key_dir/fork-release.key.pem"
+expect_die fork_ensure_release_keys "$key_dir"
+assert_err "refusing to follow symlink"
+assert_eq "$(cat "$ROOT_TMP/key-victim")" "not-a-key" "key victim"
+assert_eq "$(stat -c %i -- "$ROOT_TMP/key-victim")" "$key_inode" "key victim inode"
+if [ ! -L "$key_dir/fork-release.key.pem" ]; then
+  printf 'FAIL key symlink to a file was replaced\n' >&2
+  exit 1
+fi
+
+key_ok=$ROOT_TMP/keys-ok
+mkdir -m 0700 "$key_ok"
+key_umask=$(umask)
+run_ok fork_ensure_release_keys "$key_ok"
+assert_eq "$(umask)" "$key_umask" "umask restored"
+assert_eq "$(stat -c %a -- "$key_ok/fork-release.key.pem")" "600" "private key mode"
+assert_eq "$(stat -c %a -- "$key_ok/fork-release.pub.pem")" "600" "public key mode"
+if [ -L "$key_ok/fork-release.key.pem" ] || [ -L "$key_ok/fork-release.pub.pem" ]; then
+  printf 'FAIL release key is a symlink\n' >&2
+  exit 1
+fi
+priv_inode=$(stat -c %i -- "$key_ok/fork-release.key.pem")
+pub_inode=$(stat -c %i -- "$key_ok/fork-release.pub.pem")
+run_ok fork_ensure_release_keys "$key_ok"
+assert_eq "$(stat -c %i -- "$key_ok/fork-release.key.pem")" "$priv_inode" "private key reused"
+assert_eq "$(stat -c %i -- "$key_ok/fork-release.pub.pem")" "$pub_inode" "public key reused"
+mv -- "$key_ok/fork-release.pub.pem" "$key_ok/pub.real"
+ln -s "$ROOT_TMP/key-victim" "$key_ok/fork-release.pub.pem"
+expect_die fork_ensure_release_keys "$key_ok"
+assert_err "refusing to follow symlink"
+assert_eq "$(cat "$ROOT_TMP/key-victim")" "not-a-key" "public key victim"
+assert_eq "$(stat -c %i -- "$key_ok/fork-release.key.pem")" "$priv_inode" "private key kept when public key is a symlink"
+
+reset_dirs
+make_original "$HOME_DIR/timon.db"
+printf 'keep-backup\n' > "$ROOT_TMP/backup-victim"
+ln -s "$ROOT_TMP/backup-victim" "$BACKUP/db/timon.db"
+expect_die fork_sqlite_backup "$HOME_DIR/timon.db" "$BACKUP/db/timon.db"
+assert_err "refusing to follow symlink"
+assert_eq "$(cat "$ROOT_TMP/backup-victim")" "keep-backup" "backup victim"
+if [ ! -L "$BACKUP/db/timon.db" ]; then
+  printf 'FAIL backup symlink was replaced\n' >&2
+  exit 1
+fi
+
+# build.sh stops before a worktree when a file in the preparation directory
+# is a symlink. The victim is left untouched. Stubs satisfy the cheap checks.
+REPO=$(fork_repo "$ROOT/build.sh")
+COMMIT=$(git -C "$REPO" rev-parse HEAD)
+SHORT=$(git -C "$REPO" rev-parse --short=12 "$COMMIT")
+UPSTREAM=$(git -C "$REPO" show "$COMMIT:orchestrator/package.json" | sed -n 's/.*"version": *"\([^"]*\)".*/\1/p' | head -n 1)
+if [ -z "$UPSTREAM" ]; then
+  printf 'FAIL no version in orchestrator/package.json\n' >&2
+  exit 1
+fi
+VERSION_ID="${UPSTREAM}-fork.${SHORT}"
+stub_shell=$ROOT_TMP/stub-shell
+stub_modules=$ROOT_TMP/stub-modules
+mkdir -p "$stub_shell/resources/orchestrator" "$stub_modules/typescript/bin"
+: > "$stub_modules/typescript/bin/tsc"
+home_before=$(home_snapshot)
+
+prep_list=$ROOT_TMP/prep-file-link
+mkdir -p "$prep_list/out"
+printf 'keep-list\n' > "$ROOT_TMP/list-victim"
+list_inode=$(stat -c %i -- "$ROOT_TMP/list-victim")
+ln -s "$ROOT_TMP/list-victim" "$prep_list/out/${VERSION_ID}.files.sha256"
+expect_fail "$ROOT/build.sh" --prep "$prep_list" --commit HEAD --shell "$stub_shell" --modules "$stub_modules"
+assert_err "refusing to follow symlink"
+assert_eq "$(cat "$ROOT_TMP/list-victim")" "keep-list" "build list victim"
+assert_eq "$(stat -c %i -- "$ROOT_TMP/list-victim")" "$list_inode" "build list inode"
+if [ ! -L "$prep_list/out/${VERSION_ID}.files.sha256" ]; then
+  printf 'FAIL list symlink was replaced\n' >&2
+  exit 1
+fi
+if [ -e "$prep_list/src" ] || [ -e "$prep_list/stage" ] || [ -e "$prep_list/keys" ]; then
+  printf 'FAIL build continued after a planted file symlink\n' >&2
+  exit 1
+fi
+
+prep_key=$ROOT_TMP/prep-key-link
+mkdir -p "$prep_key/keys/$VERSION_ID"
+chmod 0700 "$prep_key" "$prep_key/keys" "$prep_key/keys/$VERSION_ID"
+key_missing=$ROOT_TMP/key-missing
+ln -s "$key_missing" "$prep_key/keys/$VERSION_ID/fork-release.key.pem"
+expect_fail "$ROOT/build.sh" --prep "$prep_key" --commit HEAD --shell "$stub_shell" --modules "$stub_modules"
+assert_err "refusing to follow symlink"
+if [ -e "$key_missing" ] || [ -L "$key_missing" ]; then
+  printf 'FAIL build wrote the private key through a dangling symlink\n' >&2
+  exit 1
+fi
+if [ ! -L "$prep_key/keys/$VERSION_ID/fork-release.key.pem" ]; then
+  printf 'FAIL build replaced the key symlink\n' >&2
+  exit 1
+fi
+if [ -e "$prep_key/src" ] || [ -e "$prep_key/stage" ]; then
+  printf 'FAIL build continued after a planted key symlink\n' >&2
+  exit 1
+fi
+assert_eq "$(home_snapshot)" "$home_before" "fake home after planted file symlinks"
 TIMON_FORK_DATA_HOME=$old_data_home
 
 if [ -s "$FORK_TEST_SYSTEMCTL_LOG" ]; then

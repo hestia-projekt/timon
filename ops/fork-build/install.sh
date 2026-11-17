@@ -143,7 +143,8 @@ leftover=$(rsync -a --dry-run --itemize-changes $RSYNC_EXCLUDES "$HOME_DIR/" "$D
 [ -z "$leftover" ] || fork_die "home backup does not match the source"
 
 RELEASE_SRC="$HOME_DIR/desktop-runtime/releases/$ACTIVE"
-cp -a -- "$RELEASE_SRC" "$DEST/official-release"
+release_backup=$(fork_confine_file "$DEST/official-release" "$DEST" "official release backup") || exit 1
+cp -a -- "$RELEASE_SRC" "$release_backup"
 src_sum=$(sha256sum "$RELEASE_SRC/resources/orchestrator/release-manifest.json" | awk '{print $1}')
 dst_sum=$(sha256sum "$DEST/official-release/resources/orchestrator/release-manifest.json" | awk '{print $1}')
 [ "$src_sum" = "$dst_sum" ] || fork_die "official release backup does not match the manifest"
@@ -151,8 +152,11 @@ src_n=$(find "$RELEASE_SRC" -type f | wc -l)
 dst_n=$(find "$DEST/official-release" -type f | wc -l)
 [ "$src_n" = "$dst_n" ] || fork_die "official release backup file count differs ($src_n vs $dst_n)"
 
-cp -a -- "$UNIT_FILE" "$DEST/unit.service"
-cp -a -- "$HOME_DIR/desktop-runtime/active-release" "$DEST/active-release"
+unit_backup=$(fork_confine_file "$DEST/unit.service" "$DEST" "unit backup") || exit 1
+cp -a -- "$UNIT_FILE" "$unit_backup"
+active_backup=$(fork_confine_file "$DEST/active-release" "$DEST" "active-release backup") || exit 1
+cp -a -- "$HOME_DIR/desktop-runtime/active-release" "$active_backup"
+manifest=$(fork_confine_file "$DEST/manifest.json" "$DEST" "backup manifest") || exit 1
 jq -n \
   --arg stamp "$STAMP" \
   --arg unit "$UNIT_NAME" \
@@ -162,7 +166,7 @@ jq -n \
   --arg timon "$FP_TIMON" \
   --arg integrations "$FP_INTEGRATIONS" \
   '{stamp: $stamp, unit: $unit, port: $port, activeRelease: $active, packageVersionId: $package, databases: {"timon.db": {fingerprint: $timon}, "integrations.db": {fingerprint: $integrations}}}' \
-  > "$DEST/manifest.json"
+  > "$manifest"
 fork_privatize_tree "$DEST"
 for db_name in timon.db integrations.db; do
   db_copy="$DEST/db/$db_name"
@@ -177,6 +181,7 @@ partial="$HOME_DIR/desktop-runtime/releases/$VERSION_ID.partial"
 if [ -e "$partial" ] || [ -L "$partial" ]; then
   fork_die "partial release already exists: $partial"
 fi
+partial=$(fork_confine_file "$partial" "$(dirname -- "$partial")" "partial release") || exit 1
 if ! cp -a -- "$PACKAGE" "$partial"; then
   if [ -d "$partial" ] && [ ! -L "$partial" ]; then
     fork_remove_created_dir "$partial" "$HOME_DIR/desktop-runtime/releases" "$(stat -c '%d:%i' -- "$partial")" || true
@@ -193,6 +198,7 @@ created_release=$TARGET
 
 OLD_PATH="$HOME_DIR/desktop-runtime/releases/$ACTIVE"
 NEW_PATH="$TARGET"
+unit_file=$(fork_confine_file "$UNIT_FILE" "$(dirname -- "$UNIT_FILE")" "unit file") || exit 1
 # shellcheck disable=SC2016 # node source stays single-quoted so the shell does not expand it
 node --input-type=module -e '
   import { readFileSync, writeFileSync } from "node:fs";
@@ -207,9 +213,10 @@ node --input-type=module -e '
   if (!text.includes(marker)) throw new Error("unit has no TIMON_DESKTOP_VERSION");
   text = text.replace(/Environment="TIMON_DESKTOP_VERSION=[^"]*"/, `Environment="TIMON_DESKTOP_VERSION=${version}"`);
   writeFileSync(file, text);
-' "$UNIT_FILE" "$OLD_PATH" "$NEW_PATH" "$VERSION_ID"
+' "$unit_file" "$OLD_PATH" "$NEW_PATH" "$VERSION_ID"
 
-printf '%s\n' "$VERSION_ID" > "$HOME_DIR/desktop-runtime/active-release"
+active_pointer=$(fork_confine_file "$HOME_DIR/desktop-runtime/active-release" "$HOME_DIR/desktop-runtime" "active release") || exit 1
+printf '%s\n' "$VERSION_ID" > "$active_pointer"
 systemctl --user daemon-reload
 systemctl --user restart "$UNIT_NAME"
 UNIT_HOME=$(fork_unit_home "$UNIT_FILE")

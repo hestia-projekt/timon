@@ -40,7 +40,7 @@ smoke_token=$(stat -c '%d:%i' -- "$SMOKE")
 
 PORT=$(node -e 'const net = require("node:net"); const s = net.createServer(); s.listen(0, "127.0.0.1", () => { process.stdout.write(String(s.address().port)); s.close(); });')
 UNIT="timon-fork-verify-$$"
-LOG="$PREP/verify-${UNIT}.log"
+LOG=$(fork_confine_file "$PREP/verify-${UNIT}.log" "$PREP" "verify log") || exit 1
 : > "$LOG"
 VERSION_ID=$(basename -- "$PACKAGE")
 

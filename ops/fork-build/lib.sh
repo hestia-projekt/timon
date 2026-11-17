@@ -50,6 +50,190 @@ fork_confine() {
   printf '%s\n' "$fc_canon"
 }
 
+# A file to open for writing under a directory the caller already confined.
+# $2 is that directory: it must exist and must not be a symlink. The leaf is
+# not resolved. A symlink there is refused, including a dangling one, and so
+# is anything that exists and is not a regular file. Nothing is created.
+# Prints the path to open. Mirrors confined() in assemble-release.mjs.
+# Shell redirection, openssl -out, sqlite .backup and cp follow a symlink,
+# and [ ! -f ] is true for a dangling one, so that test is not a guard.
+fork_confine_file() {
+  fcf_path=$1
+  fcf_parent=$2
+  fcf_label=${3:-file}
+  [ -n "$fcf_path" ] || fork_die "missing $fcf_label"
+  [ -n "$fcf_parent" ] || fork_die "missing confined parent for $fcf_label"
+  if [ -L "$fcf_parent" ]; then
+    fork_die "$fcf_label parent is a symlink: $fcf_parent"
+  fi
+  if [ ! -d "$fcf_parent" ]; then
+    fork_die "$fcf_label parent is not a directory: $fcf_parent"
+  fi
+  fcf_parent_canon=$(fork_canonical_path "$fcf_parent")
+  fcf_base=$(basename -- "$fcf_path")
+  case "$fcf_base" in
+    ''|.|..) fork_die "refusing to write $fcf_label" ;;
+  esac
+  fcf_dir=$(dirname -- "$fcf_path")
+  if [ -L "$fcf_dir" ]; then
+    fork_die "refusing to follow symlink $fcf_dir"
+  fi
+  if [ ! -d "$fcf_dir" ]; then
+    fork_die "$fcf_label parent is not a directory: $fcf_dir"
+  fi
+  fcf_dir_canon=$(fork_canonical_path "$fcf_dir")
+  case "$fcf_dir_canon" in
+    "$fcf_parent_canon"|"$fcf_parent_canon"/*) ;;
+    *) fork_die "$fcf_label leaves its confined parent ($fcf_dir_canon)" ;;
+  esac
+  # Refuse a symlink in any directory between the confined parent and the leaf.
+  fcf_walk=$fcf_parent_canon
+  fcf_rest=${fcf_dir_canon#"$fcf_parent_canon"}
+  fcf_rest=${fcf_rest#/}
+  while [ -n "$fcf_rest" ]; do
+    fcf_part=${fcf_rest%%/*}
+    case "$fcf_part" in
+      ''|.|..) fork_die "refusing to write $fcf_label" ;;
+    esac
+    fcf_walk="$fcf_walk/$fcf_part"
+    if [ -L "$fcf_walk" ]; then
+      fork_die "refusing to follow symlink $fcf_walk"
+    fi
+    if [ ! -d "$fcf_walk" ]; then
+      fork_die "$fcf_label parent is not a directory: $fcf_walk"
+    fi
+    case "$fcf_rest" in
+      */*) fcf_rest=${fcf_rest#*/} ;;
+      *) fcf_rest= ;;
+    esac
+  done
+  fcf_full="$fcf_walk/$fcf_base"
+  case "$fcf_full" in
+    "$fcf_parent_canon"/*) ;;
+    *) fork_die "$fcf_label leaves its confined parent ($fcf_full)" ;;
+  esac
+  if [ -L "$fcf_full" ]; then
+    fork_die "refusing to follow symlink $fcf_full"
+  fi
+  if [ -e "$fcf_full" ] && [ ! -f "$fcf_full" ]; then
+    fork_die "$fcf_label is not a regular file: $fcf_full"
+  fi
+  printf '%s\n' "$fcf_full"
+}
+
+# The Ed25519 pair for this build, in a directory this run confined.
+# An existing regular private key is kept. A symlink, or any other
+# non-file, is refused: openssl -out would follow it. A new pair is written
+# under umask 077 to temporary files in the same directory, checked, then
+# renamed into place. rename does not follow a symlink at the destination.
+fork_ensure_release_keys() {
+  fek_dir=$1
+  if [ -L "$fek_dir" ] || [ ! -d "$fek_dir" ]; then
+    fork_die "release key directory is not a directory: $fek_dir"
+  fi
+  fek_priv=$(fork_confine_file "$fek_dir/fork-release.key.pem" "$fek_dir" "release key") || exit 1
+  fek_pub=$(fork_confine_file "$fek_dir/fork-release.pub.pem" "$fek_dir" "release public key") || exit 1
+  if [ -e "$fek_priv" ]; then
+    return 0
+  fi
+  fek_umask=$(umask)
+  umask 077
+  fek_priv_tmp=$(mktemp "$fek_dir/fork-release.key.XXXXXX") || {
+    umask "$fek_umask"
+    fork_die "could not create the release key"
+  }
+  fek_pub_tmp=$(mktemp "$fek_dir/fork-release.pub.XXXXXX") || {
+    rm -f -- "$fek_priv_tmp"
+    umask "$fek_umask"
+    fork_die "could not create the release public key"
+  }
+  if ! openssl genpkey -algorithm ED25519 -out "$fek_priv_tmp"; then
+    rm -f -- "$fek_priv_tmp" "$fek_pub_tmp"
+    umask "$fek_umask"
+    fork_die "could not create the release key"
+  fi
+  if ! openssl pkey -in "$fek_priv_tmp" -pubout -out "$fek_pub_tmp"; then
+    rm -f -- "$fek_priv_tmp" "$fek_pub_tmp"
+    umask "$fek_umask"
+    fork_die "could not create the release public key"
+  fi
+  for fek_tmp in "$fek_priv_tmp" "$fek_pub_tmp"; do
+    if [ -L "$fek_tmp" ] || [ ! -f "$fek_tmp" ]; then
+      rm -f -- "$fek_priv_tmp" "$fek_pub_tmp"
+      umask "$fek_umask"
+      fork_die "release key temporary is not a regular file"
+    fi
+    chmod 0600 -- "$fek_tmp" || {
+      rm -f -- "$fek_priv_tmp" "$fek_pub_tmp"
+      umask "$fek_umask"
+      fork_die "could not restrict the release key"
+    }
+    fek_mode=$(stat -c %a -- "$fek_tmp") || fek_mode=
+    if [ "$fek_mode" != "600" ]; then
+      rm -f -- "$fek_priv_tmp" "$fek_pub_tmp"
+      umask "$fek_umask"
+      fork_die "release key temporary is mode ${fek_mode:-unknown}, expected 600"
+    fi
+  done
+  # Re-check after openssl. A symlink planted while it ran is not a destination.
+  if ! ( fork_confine_file "$fek_dir/fork-release.key.pem" "$fek_dir" "release key" >/dev/null ); then
+    rm -f -- "$fek_priv_tmp" "$fek_pub_tmp"
+    umask "$fek_umask"
+    exit 1
+  fi
+  if ! ( fork_confine_file "$fek_dir/fork-release.pub.pem" "$fek_dir" "release public key" >/dev/null ); then
+    rm -f -- "$fek_priv_tmp" "$fek_pub_tmp"
+    umask "$fek_umask"
+    exit 1
+  fi
+  if [ -L "$fek_priv" ]; then
+    rm -f -- "$fek_priv_tmp" "$fek_pub_tmp"
+    umask "$fek_umask"
+    fork_die "refusing to follow symlink $fek_priv"
+  fi
+  if [ -e "$fek_priv" ]; then
+    rm -f -- "$fek_priv_tmp" "$fek_pub_tmp"
+    umask "$fek_umask"
+    fork_die "release key path appeared during creation"
+  fi
+  # mv -n does not replace an existing name and does not follow a symlink.
+  if ! mv -T -n -- "$fek_priv_tmp" "$fek_priv"; then
+    rm -f -- "$fek_priv_tmp" "$fek_pub_tmp"
+    umask "$fek_umask"
+    fork_die "could not install the release key"
+  fi
+  if [ -L "$fek_pub" ]; then
+    rm -f -- "$fek_priv" "$fek_pub_tmp"
+    umask "$fek_umask"
+    fork_die "refusing to follow symlink $fek_pub"
+  fi
+  if [ -e "$fek_pub" ] && [ ! -f "$fek_pub" ]; then
+    rm -f -- "$fek_priv" "$fek_pub_tmp"
+    umask "$fek_umask"
+    fork_die "release public key is not a regular file: $fek_pub"
+  fi
+  if [ -e "$fek_pub" ]; then
+    if ! mv -T -f -- "$fek_pub_tmp" "$fek_pub"; then
+      rm -f -- "$fek_priv" "$fek_pub_tmp"
+      umask "$fek_umask"
+      fork_die "could not install the release public key"
+    fi
+  elif ! mv -T -n -- "$fek_pub_tmp" "$fek_pub"; then
+    rm -f -- "$fek_priv" "$fek_pub_tmp"
+    umask "$fek_umask"
+    fork_die "could not install the release public key"
+  fi
+  for fek_done in "$fek_priv" "$fek_pub"; do
+    fek_mode=$(stat -c %a -- "$fek_done") || fek_mode=
+    if [ -L "$fek_done" ] || [ ! -f "$fek_done" ] || [ "$fek_mode" != "600" ]; then
+      rm -f -- "$fek_priv" "$fek_pub"
+      umask "$fek_umask"
+      fork_die "release key is not a private regular file"
+    fi
+  done
+  umask "$fek_umask"
+}
+
 # Refuse a path that is the live Timon home or lives inside it.
 # The home itself is never a write target: a caller path that resolves to it
 # is refused before anything is created or removed.
@@ -336,6 +520,8 @@ fork_sqlite_backup() {
     printf 'absent\n'
     return 0
   fi
+  # sqlite3 .backup follows a symlink. Refuse one before it opens the copy.
+  dest=$(fork_confine_file "$dest" "$(dirname -- "$dest")" "$(basename -- "$src") backup") || return 1
   # sqlite3 creates the copy with the process umask. 022 would leave a 0644
   # database that other accounts on the machine can read.
   umask 077
@@ -521,10 +707,19 @@ fork_maybe_restore_db() {
 
   # Check the copy before it replaces the live path. A failed check leaves
   # the previous file where it is, including when that file is already gone.
-  tmp=$(mktemp "$(fork_home)/.restore-${name}.XXXXXX") || {
+  fmr_home=$(fork_canonical_path "$(fork_home)") || {
     printf 'fork-build: could not restore %s\n' "$name" >&2
     return 1
   }
+  # The template is the physical home, so mktemp does not open a symlink path.
+  tmp_new=$(mktemp "$fmr_home/.restore-${name}.XXXXXX") || {
+    printf 'fork-build: could not restore %s\n' "$name" >&2
+    return 1
+  }
+  if ! tmp=$(fork_confine_file "$tmp_new" "$fmr_home" "restored $name"); then
+    rm -f -- "$tmp_new"
+    return 1
+  fi
   if ! cp -a -- "$backup" "$tmp"; then
     rm -f -- "$tmp"
     printf 'fork-build: could not restore %s\n' "$name" >&2
@@ -654,11 +849,14 @@ fork_restore_backup() {
     printf 'fork-build: could not stop %s\n' "$unit" >&2
     return 1
   }
+  unit_file=$(fork_confine_file "$unit_file" "$(dirname -- "$unit_file")" "unit file") || return 1
   cp -a -- "$dest/unit.service" "$unit_file" || {
     printf 'fork-build: could not restore the unit file\n' >&2
     return 1
   }
-  cp -a -- "$dest/active-release" "$(fork_home)/desktop-runtime/active-release" || {
+  frb_active="$(fork_home)/desktop-runtime/active-release"
+  frb_active=$(fork_confine_file "$frb_active" "$(fork_home)/desktop-runtime" "active release") || return 1
+  cp -a -- "$dest/active-release" "$frb_active" || {
     printf 'fork-build: could not restore active-release\n' >&2
     return 1
   }
@@ -673,6 +871,7 @@ fork_restore_backup() {
       printf 'fork-build: could not create the releases directory\n' >&2
       return 1
     }
+    release_dir=$(fork_confine_file "$release_dir" "$(dirname -- "$release_dir")" "official release") || return 1
     cp -a -- "$dest/official-release" "$release_dir" || {
       printf 'fork-build: could not restore official release %s\n' "$active" >&2
       return 1
