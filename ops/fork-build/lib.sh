@@ -212,9 +212,11 @@ fork_maybe_restore_db() {
 # Stop the service, put the saved unit and pointer back, put the official
 # release tree back when its runner is gone, restore a database whose schema
 # changed, then start again and wait for health.
-# Returns 1 on failure and does not exit the shell. install.sh calls this from
-# `if`, where dash ignores set -e, so each step checks its own status. The
-# caller can then start the unit that this function has already put back.
+# Returns 1 on failure and does not exit the shell, except the "recheck"
+# argument: that path exits before the stop when a mission is running.
+# install.sh calls this from `if`, where dash ignores set -e, so each step
+# checks its own status. The caller can then start the unit that this
+# function has already put back. The failure path does not pass "recheck".
 fork_restore_backup() {
   dest=$1
   if [ ! -f "$dest/manifest.json" ]; then
@@ -250,6 +252,30 @@ fork_restore_backup() {
   unit_file=$(fork_unit_file)
   release_dir="$(fork_home)/desktop-runtime/releases/$active"
   runner="$release_dir/resources/orchestrator/dist/host/packaged-runner.js"
+
+  # rollback.sh passes "recheck". When this home's daemon still answers,
+  # the idle check is the last step before stop. update_pending, another
+  # instance, or a closed port is the same "not answering" as the first
+  # check: the restore continues. install.sh's failure path does not pass
+  # this: the unit is already stopped, and a refusal would block the restore.
+  if [ "${2:-}" = "recheck" ]; then
+    body=$(curl -fsS --max-time 2 "http://127.0.0.1:${port}/api/health" 2>/dev/null) || body=
+    live=0
+    if [ -n "$body" ]; then
+      code=0
+      printf '%s' "$body" | fork_classify_health "$(fork_instance_id "$(fork_unit_home "$unit_file")")" || code=$?
+      if [ "$code" -eq 0 ]; then
+        live=1
+      elif [ "$code" -eq 3 ] && fork_listener_in_unit "$port" "$unit"; then
+        live=1
+      fi
+    fi
+    if [ "$live" -eq 1 ]; then
+      fork_assert_idle "$(fork_home)" "$port" "$0"
+    else
+      printf 'daemon is not answering; stop continues\n'
+    fi
+  fi
 
   systemctl --user stop "$unit" || {
     printf 'fork-build: could not stop %s\n' "$unit" >&2

@@ -54,17 +54,38 @@ ops/fork-build/install.sh --package ~/timon-fork-prep/out/<id> --apply
 
 Avec `--apply`, dans l'ordre :
 
-1. Il refuse si `GET /api/missions?status=running` n'est pas vide, ou s'il ne peut pas le lire. Le jeton du démon est lu dans le fichier, jamais affiché. Une page pleine (1000 lignes) est aussi un refus : la liste serait tronquée.
-2. Il arrête l'unité. La copie qui suit ne bouge plus. Si une étape échoue avant la bascule, l'unité précédente est relancée. Après la bascule, un échec déclenche le retour arrière.
-3. Il écrit une sauvegarde horodatée dans `~/timon-fork-backups/<date>/` (ou `TIMON_FORK_BACKUP_ROOT`), hors de `~/.timon`. Le dossier racine est en `0700`. Les fichiers sont en `0600` ; un exécutable copié reste exécutable par le propriétaire seul (`0700`), pour que le retour arrière puisse lancer le binaire. Le script vérifie ces droits après la copie :
+1. Il refuse si `GET /api/missions?status=running` n'est pas vide, ou s'il ne peut pas le lire. Le jeton du démon est lu dans le fichier, jamais affiché. Une page pleine (1000 lignes) est aussi un refus : la liste serait tronquée. Sans `--apply`, le script s'arrête ici.
+2. Il prépare le dossier racine de sauvegarde (`0700`), hors de `~/.timon`.
+3. Il relit la liste des missions, et c'est la dernière action avant l'arrêt. Une mission apparue depuis le premier contrôle, ou une liste illisible, est un refus : l'unité en marche n'est pas arrêtée.
+4. Il arrête l'unité. La copie qui suit ne bouge plus. Si une étape échoue avant la bascule, l'unité précédente est relancée. Après la bascule, un échec déclenche le retour arrière.
+5. Il écrit une sauvegarde horodatée dans `~/timon-fork-backups/<date>/` (ou `TIMON_FORK_BACKUP_ROOT`). Le dossier racine est en `0700`. Les fichiers sont en `0600` ; un exécutable copié reste exécutable par le propriétaire seul (`0700`), pour que le retour arrière puisse lancer le binaire. Le script vérifie ces droits après la copie :
    - `timon.db` et `integrations.db` par `sqlite3 .backup`, puis `PRAGMA integrity_check` ;
    - le reste du dossier, sauf le runtime, les worktrees, les caches et les bases (une copie à chaud du fichier SQLite n'est pas utilisée) ; un second `rsync` à blanc doit être vide ;
    - une copie de la release officielle courante, vérifiée par le SHA-256 de `release-manifest.json` et le nombre de fichiers ;
    - l'unité systemd et le pointeur `active-release` tels qu'ils étaient.
-4. Il copie le paquet dans `desktop-runtime/releases/<id>/`, réécrit les chemins de l'unité (les drop-ins, dont le port de l'application, ne sont pas touchés), pose le pointeur, recharge systemd et redémarre l'unité.
-5. Il attend `/api/health` (`instance` est celle du home visé, `service` vaut `timon`, pas d'attente d'approbation). Une autre instance sur le port est un échec. Si le redémarrage ou la santé échoue, il exécute le retour arrière décrit plus bas, puis retire la copie du paquet. Si ce retour arrière échoue à son tour, l'unité dont les fichiers viennent d'être remis est tout de même relancée.
+6. Il copie le paquet dans `desktop-runtime/releases/<id>/`, réécrit les chemins de l'unité (les drop-ins, dont le port de l'application, ne sont pas touchés), pose le pointeur, recharge systemd et redémarre l'unité.
+7. Il attend `/api/health` (`instance` est celle du home visé, `service` vaut `timon`, pas d'attente d'approbation). Une autre instance sur le port est un échec. Si le redémarrage ou la santé échoue, il exécute le retour arrière décrit plus bas, puis retire la copie du paquet. Si ce retour arrière échoue à son tour, l'unité dont les fichiers viennent d'être remis est tout de même relancée.
+
+## Bascule
 
 La bascule ne passe pas par `timon update apply`.
+
+Ni ce fork, ni la release en service `0.1.8-40ae30b1feef`, n'ont de moyen de suspendre tous les nouveaux lancements. Le relevé (code du dépôt, et `dist` plus `bin/timon` de cette release, en lecture seule) :
+
+- aucune sous-commande `timon`, aucune route HTTP, pour mettre en pause le dispatcher Kanban, les déclencheurs ou les routines ;
+- `TIMON_MAX_LIVE_MISSIONS` ne borne que le dispatcher et le réveil, et le profil de jour a un plancher de 1 (`profileLimits` dans `orchestrator/src/resources.ts`, `Math.max(1, …)`). Le chat ne consulte pas ce plafond (`TIMON_MAX_LIVE_MISSIONS` dans `orchestrator/src/settings.ts`) ;
+- `TIMON_HARD_MAX_LIVE_MISSIONS` à 0 veut dire « automatique » (deux fois le plafond souple), ce qui laisse passer un premier lancement (`spawnAgent` dans `orchestrator/src/agent.ts`) ;
+- déclencheurs et routines s'arment un par un. Les éteindre tous réécrirait la configuration de l'opérateur, et un chat, un workflow ou un lancement déjà admis démarrerait quand même.
+
+`install.sh --apply` et `rollback.sh --apply` relisent donc la liste juste avant `systemctl --user stop`. Si une mission tourne, ou si la liste est illisible alors que le port répond, le script s'arrête et l'unité continue. `rollback.sh` continue l'arrêt seulement quand le port ne répond plus.
+
+Il reste une fenêtre : entre la réponse de ce second contrôle et la désactivation par systemd, un client, un déclencheur, une routine ou le dispatcher peut lancer une mission, que l'arrêt tue. Rien hors du démon ne ferme cette fenêtre.
+
+Avant `--apply`, sur cette machine :
+
+- couper les déclencheurs et les routines ;
+- aucune mission planifiée dans la fenêtre, aucune tâche Kanban sur le point d'être prise, aucun message envoyé au démon ;
+- rester devant la machine jusqu'à la fin de la bascule.
 
 ## Retour arrière
 
@@ -73,9 +94,9 @@ ops/fork-build/rollback.sh --backup ~/timon-fork-backups/<date>
 ops/fork-build/rollback.sh --backup ~/timon-fork-backups/<date> --apply
 ```
 
-Avec `--apply` : si le démon répond, le script refuse tant qu'une mission tourne. La restauration suit cet ordre :
+Avec `--apply` : si le démon répond, le script refuse tant qu'une mission tourne. Il relit la liste une seconde fois, juste avant l'arrêt (voir [Bascule](#bascule)). La restauration suit cet ordre :
 
-1. Arrêt de l'unité.
+1. Arrêt de l'unité, après ce second contrôle quand le port répond encore.
 2. Remise du fichier d'unité et du pointeur `active-release` sauvegardés.
 3. Lecture de `activeRelease` dans `manifest.json`. Si `desktop-runtime/releases/<activeRelease>/resources/orchestrator/dist/host/packaged-runner.js` est absent, copie de `official-release` vers ce répertoire (un répertoire incomplet est retiré avant, pour que la copie porte le nom de la release), puis vérification du SHA-256 de `release-manifest.json`.
 4. Rechargement de systemd (`daemon-reload`).

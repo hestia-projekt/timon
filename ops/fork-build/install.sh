@@ -93,6 +93,11 @@ put_service_back() {
   exit "$ec"
 }
 trap put_service_back EXIT
+# The release in service (0.1.8) has no pause for new launches: the live-mission
+# cap does not bind chat, and the day profile never goes below one mission.
+# Ask again as the last step before stop. phase stays idle until the check
+# passes, so a refusal leaves the running unit alone.
+fork_assert_idle "$HOME_DIR" "$PORT" "$SCRIPT"
 phase=stopped
 systemctl --user stop "$UNIT_NAME"
 

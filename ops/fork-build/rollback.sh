@@ -45,6 +45,6 @@ if [ "$APPLY" -ne 1 ]; then
   exit 0
 fi
 
-fork_restore_backup "$BACKUP"
+fork_restore_backup "$BACKUP" recheck
 printf 'active-release %s\n' "$(tr -d '[:space:]' < "$(fork_home)/desktop-runtime/active-release")"
 printf 'unit %s\n' "$UNIT_FILE"
