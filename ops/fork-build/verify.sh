@@ -31,12 +31,12 @@ RUNNER="$ORCH/dist/host/packaged-runner.js"
 
 PREP=$(fork_canonical_path "$(dirname -- "$PACKAGE")")
 fork_assert_outside_home "$PREP" "preparation directory"
-SMOKE=$(mktemp -d "$PREP/smoke.XXXXXX")
+SMOKE=$(mktemp -d "$PREP/smoke.XXXXXX") # portability: VPS-only fork tooling (Linux, systemd user unit)
 # A smoke directory that resolved into the live home is left in place.
 # Removing it would delete that home.
 smoke_canon=$(fork_confine "$SMOKE" "$PREP" "temporary home")
 SMOKE=$smoke_canon
-smoke_token=$(stat -c '%d:%i' -- "$SMOKE")
+smoke_token=$(stat -c '%d:%i' -- "$SMOKE") # portability: VPS-only fork tooling (Linux, systemd user unit)
 
 PORT=$(node -e 'const net = require("node:net"); const s = net.createServer(); s.listen(0, "127.0.0.1", () => { process.stdout.write(String(s.address().port)); s.close(); });')
 UNIT="timon-fork-verify-$$"
@@ -46,7 +46,7 @@ VERSION_ID=$(basename -- "$PACKAGE")
 
 cleanup() {
   ec=$?
-  systemctl --user stop "$UNIT" >/dev/null 2>&1 || true
+  systemctl --user stop "$UNIT" >/dev/null 2>&1 || true # portability: VPS-only fork tooling (Linux, systemd user unit)
   if [ "${KEEP_SMOKE:-}" != 1 ]; then
     fork_remove_created_dir "$SMOKE" "$PREP" "$smoke_token" || true
   fi
@@ -54,6 +54,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# portability: VPS-only fork tooling (Linux, systemd user unit)
 systemd-run --user --collect --unit="$UNIT" \
   -p MemoryMax=4G -p MemorySwapMax=0 -p KillMode=control-group \
   --property=WorkingDirectory="$ORCH" \
@@ -80,7 +81,7 @@ if ! HEALTH=$(fork_health "$PORT" 60 "$SMOKE" "$UNIT"); then
   exit 1
 fi
 printf 'health %s\n' "$HEALTH"
-systemctl --user stop "$UNIT"
+systemctl --user stop "$UNIT" # portability: VPS-only fork tooling (Linux, systemd user unit)
 
 PERM=$(
   cd -- "$ORCH"

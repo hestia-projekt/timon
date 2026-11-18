@@ -6,10 +6,10 @@
 #   ops/fork-build/install.sh --package DIR            # plan
 #   ops/fork-build/install.sh --package DIR --apply    # switch
 #
-# On a failed health check the previous unit is put back. A database that
-# is missing or whose schema changed is restored from the backup this run
-# just took. A database that did not exist then is removed if this run
-# created it.
+# On a failed health check the previous unit is put back. Each database
+# that existed in the backup this run just took is replaced by that copy.
+# The live file is moved aside under the backup, not deleted. A database
+# this run created is moved aside too.
 # See ops/fork-build/README.md.
 set -eu
 
@@ -96,7 +96,7 @@ put_service_back() {
   case "$current" in
     stopped)
       printf 'starting the previous service\n' >&2
-      systemctl --user start "$UNIT_NAME" || true
+      systemctl --user start "$UNIT_NAME" || true # portability: VPS-only fork tooling (Linux, systemd user unit)
       ;;
     backed-up)
       printf 'restoring the previous service\n' >&2
@@ -107,7 +107,7 @@ put_service_back() {
           fork_remove_created_dir "$created_release" "$HOME_DIR/desktop-runtime/releases" "$created_release_token" || true
         fi
       else
-        systemctl --user start "$UNIT_NAME" || true
+        systemctl --user start "$UNIT_NAME" || true # portability: VPS-only fork tooling (Linux, systemd user unit)
       fi
       ;;
   esac
@@ -120,7 +120,7 @@ trap put_service_back EXIT
 # passes, so a refusal leaves the running unit alone.
 fork_assert_idle "$HOME_DIR" "$PORT" "$SCRIPT"
 phase=stopped
-systemctl --user stop "$UNIT_NAME"
+systemctl --user stop "$UNIT_NAME" # portability: VPS-only fork tooling (Linux, systemd user unit)
 
 STAMP=$(date -u +%Y%m%dT%H%M%SZ)
 DEST="$BACKUP_ROOT/$STAMP"
@@ -129,7 +129,7 @@ if [ -e "$DEST" ] || [ -L "$DEST" ]; then
 fi
 mkdir -m 0700 -- "$DEST" || fork_die "cannot create $DEST"
 mkdir -m 0700 -- "$DEST/db" "$DEST/home" || fork_die "cannot create $DEST"
-dest_mode=$(stat -c %a -- "$DEST")
+dest_mode=$(stat -c %a -- "$DEST") # portability: VPS-only fork tooling (Linux, systemd user unit)
 [ "$dest_mode" = "700" ] || fork_die "timestamped backup is mode $dest_mode, expected 700"
 
 FP_TIMON=$(fork_sqlite_backup "$HOME_DIR/timon.db" "$DEST/db/timon.db")
@@ -137,25 +137,25 @@ FP_INTEGRATIONS=$(fork_sqlite_backup "$HOME_DIR/integrations.db" "$DEST/db/integ
 
 RSYNC_EXCLUDES="--exclude /desktop-runtime --exclude /worktrees --exclude /provider-runs --exclude /backups --exclude /run --exclude /tmp --exclude /updates --exclude /provider-cache --exclude /trash --exclude /timon.db --exclude /timon.db-wal --exclude /timon.db-shm --exclude /integrations.db --exclude /integrations.db-wal --exclude /integrations.db-shm"
 # shellcheck disable=SC2086
-rsync -a $RSYNC_EXCLUDES "$HOME_DIR/" "$DEST/home/"
+rsync -a $RSYNC_EXCLUDES "$HOME_DIR/" "$DEST/home/" # portability: VPS-only fork tooling (Linux, systemd user unit)
 # shellcheck disable=SC2086
-leftover=$(rsync -a --dry-run --itemize-changes $RSYNC_EXCLUDES "$HOME_DIR/" "$DEST/home/")
+leftover=$(rsync -a --dry-run --itemize-changes $RSYNC_EXCLUDES "$HOME_DIR/" "$DEST/home/") # portability: VPS-only fork tooling (Linux, systemd user unit)
 [ -z "$leftover" ] || fork_die "home backup does not match the source"
 
 RELEASE_SRC="$HOME_DIR/desktop-runtime/releases/$ACTIVE"
 release_backup=$(fork_confine_file "$DEST/official-release" "$DEST" "official release backup") || exit 1
-cp -a -- "$RELEASE_SRC" "$release_backup"
-src_sum=$(sha256sum "$RELEASE_SRC/resources/orchestrator/release-manifest.json" | awk '{print $1}')
-dst_sum=$(sha256sum "$DEST/official-release/resources/orchestrator/release-manifest.json" | awk '{print $1}')
+cp -a -- "$RELEASE_SRC" "$release_backup" # portability: VPS-only fork tooling (Linux, systemd user unit)
+src_sum=$(sha256sum "$RELEASE_SRC/resources/orchestrator/release-manifest.json" | awk '{print $1}') # portability: VPS-only fork tooling (Linux, systemd user unit)
+dst_sum=$(sha256sum "$DEST/official-release/resources/orchestrator/release-manifest.json" | awk '{print $1}') # portability: VPS-only fork tooling (Linux, systemd user unit)
 [ "$src_sum" = "$dst_sum" ] || fork_die "official release backup does not match the manifest"
-src_n=$(find "$RELEASE_SRC" -type f | wc -l)
-dst_n=$(find "$DEST/official-release" -type f | wc -l)
+src_n=$(find "$RELEASE_SRC" -type f | wc -l) # portability: VPS-only fork tooling (Linux, systemd user unit)
+dst_n=$(find "$DEST/official-release" -type f | wc -l) # portability: VPS-only fork tooling (Linux, systemd user unit)
 [ "$src_n" = "$dst_n" ] || fork_die "official release backup file count differs ($src_n vs $dst_n)"
 
 unit_backup=$(fork_confine_file "$DEST/unit.service" "$DEST" "unit backup") || exit 1
-cp -a -- "$UNIT_FILE" "$unit_backup"
+cp -a -- "$UNIT_FILE" "$unit_backup" # portability: VPS-only fork tooling (Linux, systemd user unit)
 active_backup=$(fork_confine_file "$DEST/active-release" "$DEST" "active-release backup") || exit 1
-cp -a -- "$HOME_DIR/desktop-runtime/active-release" "$active_backup"
+cp -a -- "$HOME_DIR/desktop-runtime/active-release" "$active_backup" # portability: VPS-only fork tooling (Linux, systemd user unit)
 manifest=$(fork_confine_file "$DEST/manifest.json" "$DEST" "backup manifest") || exit 1
 jq -n \
   --arg stamp "$STAMP" \
@@ -171,7 +171,7 @@ fork_privatize_tree "$DEST"
 for db_name in timon.db integrations.db; do
   db_copy="$DEST/db/$db_name"
   [ -f "$db_copy" ] || continue
-  db_mode=$(stat -c %a -- "$db_copy")
+  db_mode=$(stat -c %a -- "$db_copy") # portability: VPS-only fork tooling (Linux, systemd user unit)
   [ "$db_mode" = "600" ] || fork_die "backup of $db_name is mode $db_mode, expected 600"
 done
 printf 'backup %s\n' "$DEST"
@@ -182,13 +182,13 @@ if [ -e "$partial" ] || [ -L "$partial" ]; then
   fork_die "partial release already exists: $partial"
 fi
 partial=$(fork_confine_file "$partial" "$(dirname -- "$partial")" "partial release") || exit 1
-if ! cp -a -- "$PACKAGE" "$partial"; then
+if ! cp -a -- "$PACKAGE" "$partial"; then # portability: VPS-only fork tooling (Linux, systemd user unit)
   if [ -d "$partial" ] && [ ! -L "$partial" ]; then
-    fork_remove_created_dir "$partial" "$HOME_DIR/desktop-runtime/releases" "$(stat -c '%d:%i' -- "$partial")" || true
+    fork_remove_created_dir "$partial" "$HOME_DIR/desktop-runtime/releases" "$(stat -c '%d:%i' -- "$partial")" || true # portability: VPS-only fork tooling (Linux, systemd user unit)
   fi
   fork_die "cannot copy the package"
 fi
-created_release_token=$(stat -c '%d:%i' -- "$partial")
+created_release_token=$(stat -c '%d:%i' -- "$partial") # portability: VPS-only fork tooling (Linux, systemd user unit)
 created_release=$partial
 if ! mv -T -- "$partial" "$TARGET"; then
   fork_die "cannot install release directory"
@@ -217,8 +217,8 @@ node --input-type=module -e '
 
 active_pointer=$(fork_confine_file "$HOME_DIR/desktop-runtime/active-release" "$HOME_DIR/desktop-runtime" "active release") || exit 1
 printf '%s\n' "$VERSION_ID" > "$active_pointer"
-systemctl --user daemon-reload
-systemctl --user restart "$UNIT_NAME"
+systemctl --user daemon-reload # portability: VPS-only fork tooling (Linux, systemd user unit)
+systemctl --user restart "$UNIT_NAME" # portability: VPS-only fork tooling (Linux, systemd user unit)
 UNIT_HOME=$(fork_unit_home "$UNIT_FILE")
 fork_health "$PORT" 60 "$UNIT_HOME" "$UNIT_NAME" >/dev/null
 phase="done"

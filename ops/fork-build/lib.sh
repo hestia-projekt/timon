@@ -24,7 +24,7 @@ fork_home() {
 # followed. This does not create anything.
 fork_canonical_path() {
   [ -n "$1" ] || fork_die "missing path"
-  realpath -m -- "$1" || fork_die "cannot resolve $1"
+  realpath -m -- "$1" || fork_die "cannot resolve $1" # portability: VPS-only fork tooling (Linux, systemd user unit)
 }
 
 fork_live_home_path() {
@@ -138,21 +138,21 @@ fork_ensure_release_keys() {
   fi
   fek_umask=$(umask)
   umask 077
-  fek_priv_tmp=$(mktemp "$fek_dir/fork-release.key.XXXXXX") || {
+  fek_priv_tmp=$(mktemp "$fek_dir/fork-release.key.XXXXXX") || { # portability: VPS-only fork tooling (Linux, systemd user unit)
     umask "$fek_umask"
     fork_die "could not create the release key"
   }
-  fek_pub_tmp=$(mktemp "$fek_dir/fork-release.pub.XXXXXX") || {
+  fek_pub_tmp=$(mktemp "$fek_dir/fork-release.pub.XXXXXX") || { # portability: VPS-only fork tooling (Linux, systemd user unit)
     rm -f -- "$fek_priv_tmp"
     umask "$fek_umask"
     fork_die "could not create the release public key"
   }
-  if ! openssl genpkey -algorithm ED25519 -out "$fek_priv_tmp"; then
+  if ! openssl genpkey -algorithm ED25519 -out "$fek_priv_tmp"; then # portability: VPS-only fork tooling (Linux, systemd user unit)
     rm -f -- "$fek_priv_tmp" "$fek_pub_tmp"
     umask "$fek_umask"
     fork_die "could not create the release key"
   fi
-  if ! openssl pkey -in "$fek_priv_tmp" -pubout -out "$fek_pub_tmp"; then
+  if ! openssl pkey -in "$fek_priv_tmp" -pubout -out "$fek_pub_tmp"; then # portability: VPS-only fork tooling (Linux, systemd user unit)
     rm -f -- "$fek_priv_tmp" "$fek_pub_tmp"
     umask "$fek_umask"
     fork_die "could not create the release public key"
@@ -163,12 +163,12 @@ fork_ensure_release_keys() {
       umask "$fek_umask"
       fork_die "release key temporary is not a regular file"
     fi
-    chmod 0600 -- "$fek_tmp" || {
+    chmod 0600 -- "$fek_tmp" || { # portability: VPS-only fork tooling (Linux, systemd user unit)
       rm -f -- "$fek_priv_tmp" "$fek_pub_tmp"
       umask "$fek_umask"
       fork_die "could not restrict the release key"
     }
-    fek_mode=$(stat -c %a -- "$fek_tmp") || fek_mode=
+    fek_mode=$(stat -c %a -- "$fek_tmp") || fek_mode= # portability: VPS-only fork tooling (Linux, systemd user unit)
     if [ "$fek_mode" != "600" ]; then
       rm -f -- "$fek_priv_tmp" "$fek_pub_tmp"
       umask "$fek_umask"
@@ -224,7 +224,7 @@ fork_ensure_release_keys() {
     fork_die "could not install the release public key"
   fi
   for fek_done in "$fek_priv" "$fek_pub"; do
-    fek_mode=$(stat -c %a -- "$fek_done") || fek_mode=
+    fek_mode=$(stat -c %a -- "$fek_done") || fek_mode= # portability: VPS-only fork tooling (Linux, systemd user unit)
     if [ -L "$fek_done" ] || [ ! -f "$fek_done" ] || [ "$fek_mode" != "600" ]; then
       rm -f -- "$fek_priv" "$fek_pub"
       umask "$fek_umask"
@@ -293,9 +293,9 @@ fork_require_private_dir() {
   if [ -L "$frp_target" ] || [ ! -d "$frp_target" ]; then
     fork_die "$frp_label is not a directory: $frp_target"
   fi
-  frp_owner=$(stat -c %u -- "$frp_target") || fork_die "cannot read ownership of $frp_target"
-  frp_mode=$(stat -c %a -- "$frp_target") || fork_die "cannot read mode of $frp_target"
-  frp_me=$(id -u)
+  frp_owner=$(stat -c %u -- "$frp_target") || fork_die "cannot read ownership of $frp_target" # portability: VPS-only fork tooling (Linux, systemd user unit)
+  frp_mode=$(stat -c %a -- "$frp_target") || fork_die "cannot read mode of $frp_target" # portability: VPS-only fork tooling (Linux, systemd user unit)
+  frp_me=$(id -u) # portability: VPS-only fork tooling (Linux, systemd user unit)
   if [ "$frp_owner" != "$frp_me" ]; then
     fork_die "$frp_label $frp_target is owned by uid $frp_owner, not $frp_me (not changing it)"
   fi
@@ -373,15 +373,15 @@ fork_remove_created_dir() {
     printf 'fork-build: refusing to remove symlink %s\n' "$frc_dir" >&2
     return 1
   fi
-  frc_canon=$(realpath -m -- "$frc_dir") || {
+  frc_canon=$(realpath -m -- "$frc_dir") || { # portability: VPS-only fork tooling (Linux, systemd user unit)
     printf 'fork-build: cannot resolve %s\n' "$frc_dir" >&2
     return 1
   }
-  frc_parent_canon=$(realpath -m -- "$frc_parent") || {
+  frc_parent_canon=$(realpath -m -- "$frc_parent") || { # portability: VPS-only fork tooling (Linux, systemd user unit)
     printf 'fork-build: cannot resolve %s\n' "$frc_parent" >&2
     return 1
   }
-  frc_home=$(realpath -m -- "$(fork_home)") || {
+  frc_home=$(realpath -m -- "$(fork_home)") || { # portability: VPS-only fork tooling (Linux, systemd user unit)
     printf 'fork-build: cannot resolve the live Timon home\n' >&2
     return 1
   }
@@ -403,7 +403,7 @@ fork_remove_created_dir() {
       return 1
       ;;
   esac
-  frc_now=$(stat -c '%d:%i' -- "$frc_canon") || {
+  frc_now=$(stat -c '%d:%i' -- "$frc_canon") || { # portability: VPS-only fork tooling (Linux, systemd user unit)
     printf 'fork-build: cannot stat %s\n' "$frc_canon" >&2
     return 1
   }
@@ -425,7 +425,7 @@ fork_move_incomplete_release() {
     return 1
   fi
   fmi_home=$(fork_home)
-  fmi_home_phys=$(realpath -m -- "$fmi_home") || {
+  fmi_home_phys=$(realpath -m -- "$fmi_home") || { # portability: VPS-only fork tooling (Linux, systemd user unit)
     printf 'fork-build: cannot resolve the live Timon home\n' >&2
     return 1
   }
@@ -441,7 +441,7 @@ fork_move_incomplete_release() {
     printf 'fork-build: release path is a symlink\n' >&2
     return 1
   fi
-  fmi_phys=$(realpath -m -- "$fmi_release") || {
+  fmi_phys=$(realpath -m -- "$fmi_release") || { # portability: VPS-only fork tooling (Linux, systemd user unit)
     printf 'fork-build: cannot resolve %s\n' "$fmi_release" >&2
     return 1
   }
@@ -489,7 +489,7 @@ fork_unit_file() {
 
 fork_port_from_unit() {
   unit=$1
-  port=$(sed -n 's/^Environment="PORT=\([0-9][0-9]*\)".*/\1/p' "$unit" | head -n 1)
+  port=$(sed -n 's/^Environment="PORT=\([0-9][0-9]*\)".*/\1/p' "$unit" | head -n 1) # portability: VPS-only fork tooling (Linux, systemd user unit)
   [ -n "$port" ] || fork_die "no PORT in $unit"
   printf '%s\n' "$port"
 }
@@ -510,7 +510,7 @@ fork_assert_idle() {
 }
 
 fork_schema_fingerprint() {
-  sqlite3 "$1" "SELECT type || ' ' || name || ' ' || coalesce(sql, '') FROM sqlite_master ORDER BY 1;" | sha256sum | awk '{print $1}'
+  sqlite3 "$1" "SELECT type || ' ' || name || ' ' || coalesce(sql, '') FROM sqlite_master ORDER BY 1;" | sha256sum | awk '{print $1}' # portability: VPS-only fork tooling (Linux, systemd user unit)
 }
 
 fork_sqlite_backup() {
@@ -525,11 +525,11 @@ fork_sqlite_backup() {
   # sqlite3 creates the copy with the process umask. 022 would leave a 0644
   # database that other accounts on the machine can read.
   umask 077
-  sqlite3 "$src" ".backup '$dest'"
-  chmod 0600 "$dest" || fork_die "cannot restrict backup of $(basename "$src")"
-  mode=$(stat -c %a -- "$dest")
+  sqlite3 "$src" ".backup '$dest'" # portability: VPS-only fork tooling (Linux, systemd user unit)
+  chmod 0600 "$dest" || fork_die "cannot restrict backup of $(basename "$src")" # portability: VPS-only fork tooling (Linux, systemd user unit)
+  mode=$(stat -c %a -- "$dest") # portability: VPS-only fork tooling (Linux, systemd user unit)
   [ "$mode" = "600" ] || fork_die "backup of $(basename "$src") is mode $mode, expected 600"
-  check=$(sqlite3 "$dest" "PRAGMA integrity_check;")
+  check=$(sqlite3 "$dest" "PRAGMA integrity_check;") # portability: VPS-only fork tooling (Linux, systemd user unit)
   [ "$check" = "ok" ] || fork_die "backup of $(basename "$src") failed integrity_check"
   fork_schema_fingerprint "$dest"
 }
@@ -551,21 +551,21 @@ fork_privatize_tree() {
   [ ! -L "$root" ] || fork_die "refusing to restrict a symlink: $root"
   fpt_root=$(fork_canonical_path "$root")
   fork_assert_outside_home "$fpt_root" "backup"
-  fpt_owner=$(stat -c %u -- "$fpt_root") || fork_die "cannot read ownership of $root"
-  fpt_mode=$(stat -c %a -- "$fpt_root") || fork_die "cannot read mode of $root"
-  if [ "$fpt_owner" != "$(id -u)" ] || [ "$fpt_mode" != "700" ]; then
+  fpt_owner=$(stat -c %u -- "$fpt_root") || fork_die "cannot read ownership of $root" # portability: VPS-only fork tooling (Linux, systemd user unit)
+  fpt_mode=$(stat -c %a -- "$fpt_root") || fork_die "cannot read mode of $root" # portability: VPS-only fork tooling (Linux, systemd user unit)
+  if [ "$fpt_owner" != "$(id -u)" ] || [ "$fpt_mode" != "700" ]; then # portability: VPS-only fork tooling (Linux, systemd user unit)
     fork_die "refusing to restrict $fpt_root (owned by uid $fpt_owner, mode $fpt_mode); not changing it"
   fi
-  find "$fpt_root" -mindepth 1 -type d -exec chmod 0700 {} + || fork_die "cannot restrict directories under $root"
-  find "$fpt_root" -type f -perm /111 -exec chmod 0700 {} + || fork_die "cannot restrict executables under $root"
-  find "$fpt_root" -type f ! -perm /111 -exec chmod 0600 {} + || fork_die "cannot restrict files under $root"
-  bad=$(find "$fpt_root" \( \( -type d ! -perm 0700 \) -o \( -type f -perm /077 \) \) -print | head -n 5)
+  find "$fpt_root" -mindepth 1 -type d -exec chmod 0700 {} + || fork_die "cannot restrict directories under $root" # portability: VPS-only fork tooling (Linux, systemd user unit)
+  find "$fpt_root" -type f -perm /111 -exec chmod 0700 {} + || fork_die "cannot restrict executables under $root" # portability: VPS-only fork tooling (Linux, systemd user unit)
+  find "$fpt_root" -type f ! -perm /111 -exec chmod 0600 {} + || fork_die "cannot restrict files under $root" # portability: VPS-only fork tooling (Linux, systemd user unit)
+  bad=$(find "$fpt_root" \( \( -type d ! -perm 0700 \) -o \( -type f -perm /077 \) \) -print | head -n 5) # portability: VPS-only fork tooling (Linux, systemd user unit)
   [ -z "$bad" ] || fork_die "backup is readable by group or other: $bad"
 }
 
 # TIMON_HOME as the unit file records it. The daemon hashes that string.
 fork_unit_home() {
-  found=$(sed -n 's/^Environment="TIMON_HOME=\([^"]*\)".*/\1/p' "$1" | head -n 1)
+  found=$(sed -n 's/^Environment="TIMON_HOME=\([^"]*\)".*/\1/p' "$1" | head -n 1) # portability: VPS-only fork tooling (Linux, systemd user unit)
   if [ -n "$found" ]; then
     printf '%s\n' "$found"
   else
@@ -591,9 +591,9 @@ fork_classify_health() {
 fork_listener_in_unit() {
   port=$1
   unit=$2
-  cgroup=$(systemctl --user show -p ControlGroup --value -- "$unit" 2>/dev/null || true)
+  cgroup=$(systemctl --user show -p ControlGroup --value -- "$unit" 2>/dev/null || true) # portability: VPS-only fork tooling (Linux, systemd user unit)
   [ -n "$cgroup" ] || return 1
-  node --input-type=module -e 'import { readdirSync, readFileSync, readlinkSync } from "node:fs"; import { join } from "node:path"; const port = Number(process.argv[1]); const cgroup = process.argv[2]; if (!Number.isInteger(port) || port <= 0 || !cgroup) process.exit(1); const inodes = new Set(); for (const file of ["/proc/net/tcp", "/proc/net/tcp6"]) { let text; try { text = readFileSync(file, "utf8"); } catch { continue; } for (const line of text.trim().split("\n").slice(1)) { const parts = line.trim().split(/\s+/); if (parts[3] !== "0A") continue; const localPort = Number.parseInt(parts[1].split(":").pop(), 16); if (localPort === port) inodes.add(parts[9]); } } if (inodes.size === 0) process.exit(1); for (const pid of readdirSync("/proc")) { if (!/^[0-9]+$/.test(pid)) continue; let fds; try { fds = readdirSync(join("/proc", pid, "fd")); } catch { continue; } for (const fd of fds) { let target; try { target = readlinkSync(join("/proc", pid, "fd", fd)); } catch { continue; } const match = /^socket:\[([0-9]+)\]$/.exec(target); if (!match || !inodes.has(match[1])) continue; let group = ""; try { group = readFileSync(join("/proc", pid, "cgroup"), "utf8"); } catch { continue; } if (group.includes(cgroup)) process.exit(0); } } process.exit(1);' "$port" "$cgroup"
+  node --input-type=module -e 'import { readdirSync, readFileSync, readlinkSync } from "node:fs"; import { join } from "node:path"; const port = Number(process.argv[1]); const cgroup = process.argv[2]; if (!Number.isInteger(port) || port <= 0 || !cgroup) process.exit(1); const inodes = new Set(); for (const file of ["/proc/net/tcp", "/proc/net/tcp6"]) { let text; try { text = readFileSync(file, "utf8"); } catch { continue; } for (const line of text.trim().split("\n").slice(1)) { const parts = line.trim().split(/\s+/); if (parts[3] !== "0A") continue; const localPort = Number.parseInt(parts[1].split(":").pop(), 16); if (localPort === port) inodes.add(parts[9]); } } if (inodes.size === 0) process.exit(1); for (const pid of readdirSync("/proc")) { if (!/^[0-9]+$/.test(pid)) continue; let fds; try { fds = readdirSync(join("/proc", pid, "fd")); } catch { continue; } for (const fd of fds) { let target; try { target = readlinkSync(join("/proc", pid, "fd", fd)); } catch { continue; } const match = /^socket:\[([0-9]+)\]$/.exec(target); if (!match || !inodes.has(match[1])) continue; let group = ""; try { group = readFileSync(join("/proc", pid, "cgroup"), "utf8"); } catch { continue; } if (group.includes(cgroup)) process.exit(0); } } process.exit(1);' "$port" "$cgroup" # portability: VPS-only fork tooling (Linux, systemd user unit)
 }
 
 # fork_health PORT [TRIES] [HOME] [UNIT]
@@ -610,7 +610,7 @@ fork_health() {
   expected=$(fork_instance_id "$home")
   i=0
   while [ "$i" -lt "$tries" ]; do
-    if body=$(curl -fsS --max-time 3 "http://127.0.0.1:${port}/api/health" 2>/dev/null); then
+    if body=$(curl -fsS --max-time 3 "http://127.0.0.1:${port}/api/health" 2>/dev/null); then # portability: VPS-only fork tooling (Linux, systemd user unit)
       code=0
       printf '%s' "$body" | fork_classify_health "$expected" || code=$?
       if [ "$code" -eq 0 ]; then
@@ -639,20 +639,184 @@ fork_health() {
   return 1
 }
 
-# Put one database back, or remove one the fork created.
+# A missing path is fine. A symlink is fine (it is moved, not followed).
+# Anything else is refused: mv would nest a file inside a directory.
+fork_sqlite_entry_ok() {
+  if [ ! -e "$1" ] && [ ! -L "$1" ]; then
+    return 0
+  fi
+  if [ -L "$1" ] || [ -f "$1" ]; then
+    return 0
+  fi
+  printf 'fork-build: %s is not a regular file\n' "$2" >&2
+  return 1
+}
+
+# <backup>/post-fork, mode 0700, physically inside the backup and outside
+# the live home. Prints the directory. This subdirectory is created by the
+# restore; the backup root the caller named is not chmodded.
+fork_set_aside_dir() {
+  fsd_dest=$1
+  fsd_dir="$fsd_dest/post-fork"
+  if [ -L "$fsd_dest" ] || [ ! -d "$fsd_dest" ]; then
+    printf 'fork-build: backup is not a directory: %s\n' "$fsd_dest" >&2
+    return 1
+  fi
+  if [ -L "$fsd_dir" ]; then
+    printf 'fork-build: refusing to follow symlink %s\n' "$fsd_dir" >&2
+    return 1
+  fi
+  if [ -e "$fsd_dir" ] && [ ! -d "$fsd_dir" ]; then
+    printf 'fork-build: %s is not a directory\n' "$fsd_dir" >&2
+    return 1
+  fi
+  fsd_dest_canon=$(fork_canonical_path "$fsd_dest") || return 1
+  if [ ! -d "$fsd_dir" ]; then
+    mkdir -m 0700 -- "$fsd_dir" || {
+      printf 'fork-build: could not create %s\n' "$fsd_dir" >&2
+      return 1
+    }
+  fi
+  chmod 0700 -- "$fsd_dir" || { # portability: VPS-only fork tooling (Linux, systemd user unit)
+    printf 'fork-build: could not restrict %s\n' "$fsd_dir" >&2
+    return 1
+  }
+  fsd_mode=$(stat -c %a -- "$fsd_dir") || fsd_mode= # portability: VPS-only fork tooling (Linux, systemd user unit)
+  if [ "$fsd_mode" != "700" ]; then
+    printf 'fork-build: %s is mode %s, expected 700\n' "$fsd_dir" "$fsd_mode" >&2
+    return 1
+  fi
+  fsd_dir_canon=$(fork_canonical_path "$fsd_dir") || return 1
+  case "$fsd_dir_canon" in
+    "$fsd_dest_canon"/post-fork) ;;
+    *)
+      printf 'fork-build: refusing to set aside outside %s\n' "$fsd_dest" >&2
+      return 1
+      ;;
+  esac
+  fsd_home=$(fork_live_home_path) || return 1
+  case "$fsd_dir_canon" in
+    "$fsd_home"|"$fsd_home"/*)
+      printf 'fork-build: refusing to set aside inside the live Timon home\n' >&2
+      return 1
+      ;;
+  esac
+  printf '%s\n' "$fsd_dir"
+}
+
+# Move one sqlite file into the set-aside directory. A symlink is moved as
+# a symlink and not chmodded, so its target is unchanged. A regular file
+# becomes mode 0600. An existing destination is left untouched.
+fork_set_aside_one() {
+  fso_dir=$1
+  fso_src=$2
+  fso_leaf=$3
+  case "$fso_leaf" in
+    timon.db|integrations.db|timon.db-wal|integrations.db-wal|timon.db-shm|integrations.db-shm) ;;
+    *)
+      printf 'fork-build: refusing to set aside %s\n' "$fso_leaf" >&2
+      return 1
+      ;;
+  esac
+  fso_to="$fso_dir/$fso_leaf"
+  if [ -e "$fso_to" ] || [ -L "$fso_to" ]; then
+    printf 'fork-build: %s already has a set-aside copy\n' "$fso_leaf" >&2
+    return 1
+  fi
+  if [ -L "$fso_src" ]; then
+    mv -- "$fso_src" "$fso_to" || {
+      printf 'fork-build: could not set aside %s\n' "$fso_leaf" >&2
+      return 1
+    }
+    return 0
+  fi
+  if [ ! -f "$fso_src" ]; then
+    printf 'fork-build: %s is not a regular file\n' "$fso_leaf" >&2
+    return 1
+  fi
+  mv -- "$fso_src" "$fso_to" || {
+    printf 'fork-build: could not set aside %s\n' "$fso_leaf" >&2
+    return 1
+  }
+  if ! chmod 0600 -- "$fso_to"; then # portability: VPS-only fork tooling (Linux, systemd user unit)
+    mv -- "$fso_to" "$fso_src" || printf 'fork-build: could not put %s back\n' "$fso_leaf" >&2
+    printf 'fork-build: could not restrict set-aside %s\n' "$fso_leaf" >&2
+    return 1
+  fi
+  fso_mode=$(stat -c %a -- "$fso_to") || fso_mode= # portability: VPS-only fork tooling (Linux, systemd user unit)
+  if [ "$fso_mode" != "600" ]; then
+    mv -- "$fso_to" "$fso_src" || printf 'fork-build: could not put %s back\n' "$fso_leaf" >&2
+    printf 'fork-build: set-aside %s is mode %s, expected 600\n' "$fso_leaf" "$fso_mode" >&2
+    return 1
+  fi
+}
+
+# Put back files this run already moved. A missing piece is skipped.
+fork_set_aside_undo() {
+  fsu_dir=$1
+  fsu_name=$2
+  fsu_live=$3
+  if [ "$4" -eq 1 ] && { [ -e "$fsu_dir/$fsu_name" ] || [ -L "$fsu_dir/$fsu_name" ]; }; then
+    mv -- "$fsu_dir/$fsu_name" "$fsu_live" || printf 'fork-build: could not put %s back\n' "$fsu_name" >&2
+  fi
+  if [ "$5" -eq 1 ] && { [ -e "$fsu_dir/${fsu_name}-wal" ] || [ -L "$fsu_dir/${fsu_name}-wal" ]; }; then
+    mv -- "$fsu_dir/${fsu_name}-wal" "${fsu_live}-wal" || printf 'fork-build: could not put %s-wal back\n' "$fsu_name" >&2
+  fi
+  if [ "$6" -eq 1 ] && { [ -e "$fsu_dir/${fsu_name}-shm" ] || [ -L "$fsu_dir/${fsu_name}-shm" ]; }; then
+    mv -- "$fsu_dir/${fsu_name}-shm" "${fsu_live}-shm" || printf 'fork-build: could not put %s-shm back\n' "$fsu_name" >&2
+  fi
+}
+
+# Move the live database and its journal into <backup>/post-fork/.
+# On a partial failure, pieces already moved are put back.
+# Sets fsf_dir, fsf_did_live, fsf_did_wal, fsf_did_shm for the caller.
+fork_set_aside_family() {
+  fsf_dest=$1
+  fsf_name=$2
+  fsf_live=$3
+  fsf_did_live=0
+  fsf_did_wal=0
+  fsf_did_shm=0
+  fsf_dir=$(fork_set_aside_dir "$fsf_dest") || return 1
+  if [ -e "$fsf_live" ] || [ -L "$fsf_live" ]; then
+    fork_set_aside_one "$fsf_dir" "$fsf_live" "$fsf_name" || return 1
+    fsf_did_live=1
+  fi
+  if [ -e "${fsf_live}-wal" ] || [ -L "${fsf_live}-wal" ]; then
+    if ! fork_set_aside_one "$fsf_dir" "${fsf_live}-wal" "${fsf_name}-wal"; then
+      fork_set_aside_undo "$fsf_dir" "$fsf_name" "$fsf_live" "$fsf_did_live" 0 0
+      return 1
+    fi
+    fsf_did_wal=1
+  fi
+  if [ -e "${fsf_live}-shm" ] || [ -L "${fsf_live}-shm" ]; then
+    if ! fork_set_aside_one "$fsf_dir" "${fsf_live}-shm" "${fsf_name}-shm"; then
+      fork_set_aside_undo "$fsf_dir" "$fsf_name" "$fsf_live" "$fsf_did_live" "$fsf_did_wal" 0
+      return 1
+    fi
+    fsf_did_shm=1
+  fi
+}
+
+# Put one database back to the copy saved before the switch.
 #
 # saved is the schema fingerprint from backup time, or the word absent when
-# that file did not exist. absent is the only fingerprint that skips the
-# copy. A file created afterwards is removed, with its -wal and -shm: there
-# is no saved schema to compare, and the official daemon would otherwise
-# open a database it did not have. Writes in that new file are discarded.
+# that file did not exist. A fingerprint is not a reason to keep the live
+# file: a data migration can leave sqlite_master unchanged and still write
+# rows the older daemon cannot dispatch. When the file existed at backup
+# time, the saved copy is always installed.
 #
-# Any other fingerprint puts the saved copy back when the live file is
-# missing or its schema differs. The copy is checked first (mode 0600,
-# PRAGMA integrity_check, same fingerprint). Leftover -wal and -shm are
-# removed after that check and before the copy becomes the live file, so
-# SQLite cannot replay them onto the restored database. A matching schema
-# leaves the live file and its -wal/-shm in place.
+# The live file and its -wal and -shm are moved to <backup>/post-fork/
+# (mode 0600) and are not deleted. Writes made while the fork was running
+# stay there for a manual recovery. They are not merged back.
+#
+# absent means the file did not exist at backup time. A file the fork
+# created is moved aside the same way, not deleted, and no copy is installed.
+#
+# The saved copy is checked before anything is moved (mode 0600,
+# PRAGMA integrity_check, same fingerprint). A failed check leaves the live
+# file where it is. The journal is moved only after that check, so SQLite
+# cannot replay it onto the restored database.
 fork_maybe_restore_db() {
   dest=$1
   name=$2
@@ -668,38 +832,30 @@ fork_maybe_restore_db() {
   wal="${live}-wal"
   shm="${live}-shm"
 
-  # A directory (or anything else) must not receive the copy: mv into a
-  # directory would nest the database instead of replacing the path.
-  if [ -e "$live" ] && [ ! -f "$live" ]; then
-    printf 'fork-build: %s is not a regular file\n' "$name" >&2
-    return 1
+  fork_sqlite_entry_ok "$live" "$name" || return 1
+  fork_sqlite_entry_ok "$wal" "${name}-wal" || return 1
+  fork_sqlite_entry_ok "$shm" "${name}-shm" || return 1
+
+  fmr_present=0
+  if [ -e "$live" ] || [ -L "$live" ] || [ -e "$wal" ] || [ -L "$wal" ] || [ -e "$shm" ] || [ -L "$shm" ]; then
+    fmr_present=1
   fi
 
   if [ "$saved" = "absent" ]; then
-    if [ -e "$live" ] || [ -L "$live" ] || [ -e "$wal" ] || [ -L "$wal" ] || [ -e "$shm" ] || [ -L "$shm" ]; then
-      rm -f -- "$live" "$wal" "$shm" || {
-        printf 'fork-build: could not remove %s created after the backup\n' "$name" >&2
-        return 1
-      }
-      printf '%s removed (absent at backup)\n' "$name"
-    else
+    if [ "$fmr_present" -eq 0 ]; then
       printf '%s absent\n' "$name"
+      return 0
     fi
+    fork_set_aside_family "$dest" "$name" "$live" || return 1
+    printf '%s set aside (absent at backup)\n' "$name"
     return 0
   fi
 
-  # Opening the live file here lets SQLite checkpoint its own WAL into it.
-  # That keeps post-switch writes when the schema matches. It does not
-  # replace the file with the backup.
-  if [ -f "$live" ]; then
-    current=$(fork_schema_fingerprint "$live") || current=
-    if [ -n "$current" ] && [ "$current" = "$saved" ]; then
-      printf '%s schema unchanged\n' "$name"
-      return 0
-    fi
-  fi
-
   backup="$dest/db/$name"
+  if [ -L "$backup" ]; then
+    printf 'fork-build: refusing to follow symlink %s\n' "$backup" >&2
+    return 1
+  fi
   if [ ! -f "$backup" ]; then
     printf 'fork-build: backup of %s is missing\n' "$name" >&2
     return 1
@@ -712,7 +868,7 @@ fork_maybe_restore_db() {
     return 1
   }
   # The template is the physical home, so mktemp does not open a symlink path.
-  tmp_new=$(mktemp "$fmr_home/.restore-${name}.XXXXXX") || {
+  tmp_new=$(mktemp "$fmr_home/.restore-${name}.XXXXXX") || { # portability: VPS-only fork tooling (Linux, systemd user unit)
     printf 'fork-build: could not restore %s\n' "$name" >&2
     return 1
   }
@@ -720,23 +876,23 @@ fork_maybe_restore_db() {
     rm -f -- "$tmp_new"
     return 1
   fi
-  if ! cp -a -- "$backup" "$tmp"; then
+  if ! cp -a -- "$backup" "$tmp"; then # portability: VPS-only fork tooling (Linux, systemd user unit)
     rm -f -- "$tmp"
     printf 'fork-build: could not restore %s\n' "$name" >&2
     return 1
   fi
-  if ! chmod 0600 "$tmp"; then
+  if ! chmod 0600 "$tmp"; then # portability: VPS-only fork tooling (Linux, systemd user unit)
     rm -f -- "$tmp"
     printf 'fork-build: could not restrict restored %s\n' "$name" >&2
     return 1
   fi
-  mode=$(stat -c %a -- "$tmp") || mode=
+  mode=$(stat -c %a -- "$tmp") || mode= # portability: VPS-only fork tooling (Linux, systemd user unit)
   if [ "$mode" != "600" ]; then
     rm -f -- "$tmp"
     printf 'fork-build: restored %s is mode %s, expected 600\n' "$name" "$mode" >&2
     return 1
   fi
-  check=$(sqlite3 "$tmp" "PRAGMA integrity_check;") || check=
+  check=$(sqlite3 "$tmp" "PRAGMA integrity_check;") || check= # portability: VPS-only fork tooling (Linux, systemd user unit)
   if [ "$check" != "ok" ]; then
     rm -f -- "$tmp"
     printf 'fork-build: restored %s failed integrity_check\n' "$name" >&2
@@ -748,14 +904,21 @@ fork_maybe_restore_db() {
     printf 'fork-build: restored %s schema does not match the backup\n' "$name" >&2
     return 1
   fi
-  # The journal has to be gone before the new bytes take the live name.
-  if ! rm -f -- "$wal" "$shm"; then
-    rm -f -- "$tmp"
-    printf 'fork-build: could not remove leftover wal or shm for %s\n' "$name" >&2
-    return 1
+  # The journal has to leave the live directory before the new bytes take
+  # the live name, or SQLite replays it onto the restored database.
+  # The live file moves with it: those bytes are the fork's writes.
+  if [ "$fmr_present" -eq 1 ]; then
+    if ! fork_set_aside_family "$dest" "$name" "$live"; then
+      rm -f -- "$tmp"
+      return 1
+    fi
+    printf '%s set aside\n' "$name"
   fi
   if ! mv -f -- "$tmp" "$live"; then
     rm -f -- "$tmp"
+    if [ "$fmr_present" -eq 1 ]; then
+      fork_set_aside_undo "$fsf_dir" "$name" "$live" "$fsf_did_live" "$fsf_did_wal" "$fsf_did_shm"
+    fi
     printf 'fork-build: could not restore %s\n' "$name" >&2
     return 1
   fi
@@ -786,8 +949,21 @@ fork_restore_databases() {
 # install.sh calls this from `if`, where dash ignores set -e, so each step
 # checks its own status. The caller can then start the unit that this
 # function has already put back. The failure path does not pass "recheck".
+#
+# rollback.sh reads the fork_restore_* flags from its EXIT trap. They stay
+# 0 until the matching step has finished. fork_restore_stopped is 1 only
+# after this function has stopped the unit. fork_restore_healthy is 1 only
+# after the restarted unit has answered. fork_restore_release is 1 when the
+# official tree was copied back, 2 when its runner was already there.
+# fork_restore_dbs is 1 after both database files have been handled.
 fork_restore_backup() {
   dest=$1
+  fork_restore_stopped=0
+  fork_restore_healthy=0
+  fork_restore_unit_file=0
+  fork_restore_pointer=0
+  fork_restore_release=0
+  fork_restore_dbs=0
   if [ ! -f "$dest/manifest.json" ]; then
     printf 'fork-build: no manifest in %s\n' "$dest" >&2
     return 1
@@ -827,7 +1003,7 @@ fork_restore_backup() {
   # check: the restore continues. install.sh's failure path does not pass
   # this: the unit is already stopped, and a refusal would block the restore.
   if [ "${2:-}" = "recheck" ]; then
-    body=$(curl -fsS --max-time 2 "http://127.0.0.1:${port}/api/health" 2>/dev/null) || body=
+    body=$(curl -fsS --max-time 2 "http://127.0.0.1:${port}/api/health" 2>/dev/null) || body= # portability: VPS-only fork tooling (Linux, systemd user unit)
     live=0
     if [ -n "$body" ]; then
       code=0
@@ -845,21 +1021,28 @@ fork_restore_backup() {
     fi
   fi
 
-  systemctl --user stop "$unit" || {
+  systemctl --user stop "$unit" || { # portability: VPS-only fork tooling (Linux, systemd user unit)
     printf 'fork-build: could not stop %s\n' "$unit" >&2
     return 1
   }
+  # rollback.sh reads this after the function returns.
+  # shellcheck disable=SC2034
+  fork_restore_stopped=1
   unit_file=$(fork_confine_file "$unit_file" "$(dirname -- "$unit_file")" "unit file") || return 1
-  cp -a -- "$dest/unit.service" "$unit_file" || {
+  cp -a -- "$dest/unit.service" "$unit_file" || { # portability: VPS-only fork tooling (Linux, systemd user unit)
     printf 'fork-build: could not restore the unit file\n' >&2
     return 1
   }
+  # shellcheck disable=SC2034
+  fork_restore_unit_file=1
   frb_active="$(fork_home)/desktop-runtime/active-release"
   frb_active=$(fork_confine_file "$frb_active" "$(fork_home)/desktop-runtime" "active release") || return 1
-  cp -a -- "$dest/active-release" "$frb_active" || {
+  cp -a -- "$dest/active-release" "$frb_active" || { # portability: VPS-only fork tooling (Linux, systemd user unit)
     printf 'fork-build: could not restore active-release\n' >&2
     return 1
   }
+  # shellcheck disable=SC2034
+  fork_restore_pointer=1
   if [ ! -f "$runner" ]; then
     # cp -a copies into a directory that already exists, which would nest the
     # backup. An incomplete tree is moved aside, not deleted: this run did
@@ -872,7 +1055,7 @@ fork_restore_backup() {
       return 1
     }
     release_dir=$(fork_confine_file "$release_dir" "$(dirname -- "$release_dir")" "official release") || return 1
-    cp -a -- "$dest/official-release" "$release_dir" || {
+    cp -a -- "$dest/official-release" "$release_dir" || { # portability: VPS-only fork tooling (Linux, systemd user unit)
       printf 'fork-build: could not restore official release %s\n' "$active" >&2
       return 1
     }
@@ -882,19 +1065,26 @@ fork_restore_backup() {
       printf 'fork-build: release-manifest.json missing after restoring %s\n' "$active" >&2
       return 1
     fi
-    src_sum=$(sha256sum "$src_manifest" | awk '{print $1}')
-    dst_sum=$(sha256sum "$dst_manifest" | awk '{print $1}')
+    src_sum=$(sha256sum "$src_manifest" | awk '{print $1}') # portability: VPS-only fork tooling (Linux, systemd user unit)
+    dst_sum=$(sha256sum "$dst_manifest" | awk '{print $1}') # portability: VPS-only fork tooling (Linux, systemd user unit)
     if [ -z "$src_sum" ] || [ "$src_sum" != "$dst_sum" ]; then
       printf 'fork-build: restored release-manifest.json for %s does not match the backup\n' "$active" >&2
       return 1
     fi
+    # shellcheck disable=SC2034
+    fork_restore_release=1
+  else
+    # shellcheck disable=SC2034
+    fork_restore_release=2
   fi
-  systemctl --user daemon-reload || {
+  systemctl --user daemon-reload || { # portability: VPS-only fork tooling (Linux, systemd user unit)
     printf 'fork-build: daemon-reload failed\n' >&2
     return 1
   }
   fork_restore_databases "$dest" || return 1
-  systemctl --user start "$unit" || {
+  # shellcheck disable=SC2034
+  fork_restore_dbs=1
+  systemctl --user start "$unit" || { # portability: VPS-only fork tooling (Linux, systemd user unit)
     printf 'fork-build: could not start %s\n' "$unit" >&2
     return 1
   }
@@ -903,5 +1093,7 @@ fork_restore_backup() {
     printf 'fork-build: restored service did not answer on port %s; backup left at %s\n' "$port" "$dest" >&2
     return 1
   fi
+  # shellcheck disable=SC2034
+  fork_restore_healthy=1
   printf 'restored %s\n' "$dest"
 }

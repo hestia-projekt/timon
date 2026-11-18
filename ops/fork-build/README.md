@@ -2,6 +2,12 @@
 
 # Build du fork sur ce VPS
 
+## Portée
+
+Linux et systemd en session utilisateur, uniquement. Ce répertoire est un outillage du fork pour le VPS : il ne fait pas partie du produit, ne vise pas Windows ni macOS, et n'est pas proposé en amont.
+
+La règle des trois systèmes dans `AGENTS.md` vise le produit : `node:path` pour les chemins, pas de commande Unix hors de `orchestrator/src/host/`, pas d'hypothèse sur le superviseur. Une exception explicite est prévue : `node scripts/check-portability.mjs` accepte `// portability: <raison>` sur la ligne concernée, ou sur la ligne juste au-dessus. Ce contrôle ne parcourt pas `ops/fork-build/` (seulement le code produit). Chaque appel à systemd, chaque lecture de `/proc` et chaque commande Unix de ces scripts porte quand même `# portability: VPS-only fork tooling (Linux, systemd user unit)`, la forme shell de cette exception.
+
 `/docs` est le clone des notes internes et n'est pas versionné ici. Cette page vit à côté des scripts pour partir avec le fork.
 
 Cette procédure fait tourner un commit de `hestia-projekt/timon` sur le VPS, sans attendre la fusion amont. Elle ne bascule pas le service toute seule : `install.sh` et `rollback.sh` ne le font qu'avec `--apply`, et seulement quand aucune mission ne tourne.
@@ -102,16 +108,15 @@ Avec `--apply` : si le démon répond, le script refuse tant qu'une mission tour
 2. Remise du fichier d'unité et du pointeur `active-release` sauvegardés.
 3. Lecture de `activeRelease` dans `manifest.json`. Si `desktop-runtime/releases/<activeRelease>/resources/orchestrator/dist/host/packaged-runner.js` est absent, un répertoire incomplet à ce chemin est déplacé à côté (`<id>.incomplete`), pas supprimé : le script ne fait de suppression récursive que sur un répertoire qu'il vient de créer. La copie de `official-release` prend ensuite ce nom, puis le SHA-256 de `release-manifest.json` est vérifié. Un lien symbolique à la place de la release est un refus.
 4. Rechargement de systemd (`daemon-reload`).
-5. Restauration de `timon.db`, puis de `integrations.db`. Une base n'est ignorée que si son empreinte sauvegardée vaut `absent` : le fichier n'existait pas avant la bascule.
-   - Empreinte `absent` : la copie n'est pas remise. Un fichier apparu depuis (la release qui a échoué l'a créé), ainsi que ses `-wal` et `-shm`, est supprimé, y compris quand il ne reste que le journal. Il n'existe pas de schéma sauvegardé auquel le comparer ; le démon officiel retrouve l'absence d'avant et recrée le fichier s'il en a besoin. Les écritures faites dans ce fichier après la bascule sont perdues.
-   - Fichier vivant absent, empreinte enregistrée : la copie sauvegardée est installée. Elle est en `0600`, `PRAGMA integrity_check` doit répondre `ok`, et l'empreinte du schéma doit être celle de la sauvegarde. Ces contrôles portent sur la copie, avant qu'elle prenne le nom du fichier vivant. Les `-wal` et `-shm` résiduels sont retirés après ces contrôles et avant ce remplacement, pour que SQLite ne les rejoue pas sur la copie.
-   - Fichier vivant présent, même empreinte : il reste en place, avec ses `-wal` et `-shm`. Les écritures faites après la bascule sont gardées.
-   - Fichier vivant présent, empreinte différente : la copie sauvegardée le remplace, aux mêmes conditions (`0600`, `integrity_check`, empreinte, journal retiré avant le remplacement). Les écritures faites après la bascule sont perdues.
+5. Restauration de `timon.db`, puis de `integrations.db`. Pour une base qui existait à la sauvegarde, la copie sauvegardée est toujours remise. L'empreinte du schéma ne décide plus de garder le fichier vivant : une migration de données sans changement de DDL laisse `sqlite_master` identique, et l'ancien démon recevrait des lignes qu'il ne sait pas traiter.
+   - La base vivante n'est pas supprimée. Elle est déplacée dans `<sauvegarde>/post-fork/<nom>`, avec ses `-wal` et `-shm`, en `0600`. Les écritures faites pendant que le fork tournait sont conservées dans ce dossier, pour une récupération manuelle. Elles ne sont pas réinjectées.
+   - Empreinte `absent` : le fichier n'existait pas avant la bascule, donc aucune copie n'est remise. Un fichier apparu depuis, ainsi que ses `-wal` et `-shm`, est mis de côté de la même façon, y compris quand il ne reste que le journal. Il n'est pas supprimé.
+   - La copie remise est contrôlée avant de prendre le nom du fichier vivant : mode `0600`, `PRAGMA integrity_check` répond `ok`, empreinte égale à celle de la sauvegarde. Un contrôle en échec laisse le fichier vivant à sa place. Le journal n'est écarté qu'après ces contrôles, pour que SQLite ne le rejoue pas sur la copie.
 6. Redémarrage de l'unité et attente de `/api/health`.
 
-En cas d'échec, `fork_restore_backup` rend la main au lieu de quitter le shell. `install.sh` relance alors l'unité. `rollback.sh` s'arrête sur la même erreur. La seconde base n'est pas touchée si la première restauration a échoué.
+Si la restauration échoue après que `rollback.sh` a arrêté l'unité, le script ne laisse pas le service arrêté. Un `trap` sur `EXIT` relance l'unité, contrôle `/api/health`, et quitte avec le code d'origine. Le message dit ce qui a été remis (fichier d'unité, pointeur, release, bases) et ce qui ne l'a pas été. `fork_restore_backup` rend la main au lieu de quitter le shell : `install.sh`, qui l'appelle dans un sous-shell, relance alors l'unité de son côté. La seconde base n'est pas touchée si la première restauration a échoué.
 
-`ops/fork-build/restore-db.test.sh` rejoue ces cas dans un répertoire temporaire (`TIMON_HOME` et `TIMON_FORK_DATA_HOME`). Il n'écrit pas dans `~/.timon` et n'appelle pas systemd.
+`ops/fork-build/restore-db.test.sh` rejoue ces cas dans un répertoire temporaire (`TIMON_HOME` et `TIMON_FORK_DATA_HOME`). Il n'écrit pas dans `~/.timon`. Le `systemctl` qu'il met sur le `PATH` est un faux : il n'arrête pas l'unité de la machine.
 
 ## Recaler le fork sur une release amont
 

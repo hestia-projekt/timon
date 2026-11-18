@@ -48,7 +48,7 @@ fi
 
 COMMIT=$(git -C "$REPO" rev-parse "$COMMIT")
 SHORT=$(git -C "$REPO" rev-parse --short=12 "$COMMIT")
-UPSTREAM=$(git -C "$REPO" show "$COMMIT:orchestrator/package.json" | sed -n 's/.*"version": *"\([^"]*\)".*/\1/p' | head -n 1)
+UPSTREAM=$(git -C "$REPO" show "$COMMIT:orchestrator/package.json" | sed -n 's/.*"version": *"\([^"]*\)".*/\1/p' | head -n 1) # portability: VPS-only fork tooling (Linux, systemd user unit)
 [ -n "$UPSTREAM" ] || fork_die "no version in orchestrator/package.json at $COMMIT"
 VERSION_ID="${UPSTREAM}-fork.${SHORT}"
 fork_version_id_ok "$VERSION_ID"
@@ -125,9 +125,9 @@ OUT=$(fork_confine "$out_want" "$PREP" "output") || exit 1
 LIST=$(fork_confine_file "$out_dir/${VERSION_ID}.files.sha256" "$out_dir" "file list") || exit 1
 (
   cd -- "$OUT"
-  find . -type f -print0 | sort -z | xargs -0 -r sha256sum
+  find . -type f -print0 | sort -z | xargs -0 -r sha256sum # portability: VPS-only fork tooling (Linux, systemd user unit)
 ) > "$LIST"
-HASH=$(sha256sum "$LIST" | awk '{print $1}')
+HASH=$(sha256sum "$LIST" | awk '{print $1}') # portability: VPS-only fork tooling (Linux, systemd user unit)
 HASH_FILE=$(fork_confine_file "$out_dir/${VERSION_ID}.sha256" "$out_dir" "content hash") || exit 1
 printf '%s  %s\n' "$HASH" "$VERSION_ID" > "$HASH_FILE"
 

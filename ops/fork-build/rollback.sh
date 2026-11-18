@@ -1,9 +1,10 @@
 #!/bin/sh
 # Point the service back at the official release saved by install.sh.
-# A saved database is restored when the live file is missing or its schema
-# differs. A database that did not exist at backup time is removed if the
-# fork created it. See fork_maybe_restore_db in lib.sh.
+# Every database that existed at backup time is replaced by that copy.
+# The live file is moved aside, not deleted. A database the fork created
+# is moved aside too. See fork_maybe_restore_db in lib.sh.
 # Without --apply it prints the plan and does not restart anything.
+# With --apply, a failure after the unit has been stopped starts it again.
 #
 #   ops/fork-build/rollback.sh --backup DIR
 #   ops/fork-build/rollback.sh --backup DIR --apply
@@ -49,6 +50,51 @@ if [ "$APPLY" -ne 1 ]; then
   exit 0
 fi
 
-fork_restore_backup "$BACKUP" recheck
+# fork_restore_backup stops the unit and returns on failure instead of
+# exiting. Under set -e an unguarded failure would still run an EXIT trap,
+# but the call stays in this if so the failure is the script's own exit.
+fork_restore_stopped=0
+fork_restore_healthy=0
+fork_restore_unit_file=0
+fork_restore_pointer=0
+fork_restore_release=0
+fork_restore_dbs=0
+
+rollback_restore_word() {
+  case "$1" in
+    1) printf 'restored' ;;
+    2) printf 'already in place' ;;
+    *) printf 'not restored' ;;
+  esac
+}
+
+rollback_finish() {
+  ec=$?
+  trap - EXIT
+  if [ "$fork_restore_stopped" -eq 1 ] && [ "$fork_restore_healthy" -ne 1 ]; then
+    printf 'rollback: the unit was stopped and the restore did not finish\n' >&2
+    printf 'rollback: unit file %s; active-release %s; release %s; databases %s\n' \
+      "$(rollback_restore_word "$fork_restore_unit_file")" \
+      "$(rollback_restore_word "$fork_restore_pointer")" \
+      "$(rollback_restore_word "$fork_restore_release")" \
+      "$(rollback_restore_word "$fork_restore_dbs")" >&2
+    printf 'rollback: starting %s again\n' "$UNIT_NAME" >&2
+    if systemctl --user start "$UNIT_NAME"; then # portability: VPS-only fork tooling (Linux, systemd user unit)
+      if fork_health "$PORT" 60 "$(fork_unit_home "$UNIT_FILE")" "$UNIT_NAME" >/dev/null; then
+        printf 'rollback: %s is answering on port %s; the saved copy was not fully restored\n' "$UNIT_NAME" "$PORT" >&2
+      else
+        printf 'rollback: %s was started but is not answering on port %s; the saved copy was not fully restored\n' "$UNIT_NAME" "$PORT" >&2
+      fi
+    else
+      printf 'rollback: could not start %s; the saved copy was not fully restored\n' "$UNIT_NAME" >&2
+    fi
+  fi
+  exit "$ec"
+}
+trap rollback_finish EXIT
+
+if ! fork_restore_backup "$BACKUP" recheck; then
+  exit 1
+fi
 printf 'active-release %s\n' "$(tr -d '[:space:]' < "$(fork_home)/desktop-runtime/active-release")"
 printf 'unit %s\n' "$UNIT_FILE"

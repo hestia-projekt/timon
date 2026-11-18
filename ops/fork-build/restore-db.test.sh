@@ -1,6 +1,6 @@
 #!/bin/sh
 # Replay database restore against a temporary home.
-# Never writes ~/.timon and never calls systemd.
+# Never writes ~/.timon and never calls the real systemd.
 set -eu
 
 SCRIPT=$0
@@ -175,68 +175,143 @@ assert_eq "$(sqlite3 "$HOME_DIR/integrations.db" "SELECT note FROM t;")" "origin
 assert_eq "$(fork_schema_fingerprint "$HOME_DIR/integrations.db")" "$fp" "restored fingerprint"
 assert_gone "$HOME_DIR/integrations.db-wal"
 assert_gone "$HOME_DIR/integrations.db-shm"
+assert_out "integrations.db set aside"
+assert_file "$BACKUP/post-fork/integrations.db-wal"
+assert_file "$BACKUP/post-fork/integrations.db-shm"
+assert_eq "$(cat "$BACKUP/post-fork/integrations.db-wal")" "stale-wal" "wal set aside"
+assert_eq "$(cat "$BACKUP/post-fork/integrations.db-shm")" "stale-shm" "shm set aside"
+assert_eq "$(stat -c %a -- "$BACKUP/post-fork/integrations.db-wal")" "600" "wal mode"
+assert_eq "$(stat -c %a -- "$BACKUP/post-fork/integrations.db-shm")" "600" "shm mode"
+assert_eq "$(stat -c %a -- "$BACKUP/post-fork")" "700" "post-fork mode"
+if [ -e "$BACKUP/post-fork/integrations.db" ] || [ -L "$BACKUP/post-fork/integrations.db" ]; then
+  printf 'FAIL set aside a database that was not live\n' >&2
+  exit 1
+fi
 no_restore_leftovers
 
-# Same schema: keep the live file, including a row written after the backup.
-# The inode stays, so the backup was not copied over it.
+# Same schema, with a row written after the backup. The fingerprint matches,
+# and the saved copy is still what comes back: a data-only migration does
+# not show up in sqlite_master. The live file, including that row, is set
+# aside and is not merged back.
 reset_dirs
 make_original "$HOME_DIR/timon.db"
 fp=$(fork_schema_fingerprint "$HOME_DIR/timon.db")
 cp -a -- "$HOME_DIR/timon.db" "$BACKUP/db/timon.db"
 sqlite3 "$HOME_DIR/timon.db" "INSERT INTO t(note) VALUES ('later');"
 before=$(stat -c %i -- "$HOME_DIR/timon.db")
-rm -f -- "$BACKUP/db/timon.db"
 run_ok fork_maybe_restore_db "$BACKUP" timon.db "$fp"
-assert_out "timon.db schema unchanged"
-assert_eq "$(stat -c %i -- "$HOME_DIR/timon.db")" "$before" "live inode"
-notes=$(sqlite3 "$HOME_DIR/timon.db" "SELECT note FROM t ORDER BY id;")
+assert_out "timon.db set aside"
+assert_out "timon.db restored"
+assert_eq "$(sqlite3 "$HOME_DIR/timon.db" "SELECT note FROM t;")" "original" "live is the backup"
+assert_eq "$(stat -c %a -- "$HOME_DIR/timon.db")" "600" "restored mode"
+assert_eq "$(stat -c %i -- "$BACKUP/post-fork/timon.db")" "$before" "set-aside inode"
+notes=$(sqlite3 "$BACKUP/post-fork/timon.db" "SELECT note FROM t ORDER BY id;")
 assert_eq "$notes" "original
-later" "rows kept"
+later" "post-fork keeps the fork row"
+assert_eq "$(stat -c %a -- "$BACKUP/post-fork/timon.db")" "600" "set-aside mode"
 no_restore_leftovers
 
-# Different schema: replace the live file and drop its journal.
+# Different schema: the saved copy replaces the live file. The fork's file
+# and its journal are set aside, not deleted.
 reset_dirs
 make_original "$ROOT_TMP/official.db"
 fp=$(fork_schema_fingerprint "$ROOT_TMP/official.db")
 cp -a -- "$ROOT_TMP/official.db" "$BACKUP/db/timon.db"
 make_fork "$HOME_DIR/timon.db"
+cp -a -- "$HOME_DIR/timon.db" "$ROOT_TMP/fork-before.db"
 mark_journal "$HOME_DIR/timon.db"
 run_ok fork_maybe_restore_db "$BACKUP" timon.db "$fp"
+assert_out "timon.db set aside"
 assert_out "timon.db restored"
 assert_eq "$(sqlite3 "$HOME_DIR/timon.db" "SELECT note FROM t;")" "original" "replaced row"
 assert_eq "$(stat -c %a -- "$HOME_DIR/timon.db")" "600" "replaced mode"
 assert_eq "$(sqlite3 "$HOME_DIR/timon.db" "PRAGMA integrity_check;")" "ok" "replaced integrity"
 assert_gone "$HOME_DIR/timon.db-wal"
 assert_gone "$HOME_DIR/timon.db-shm"
+assert_eq "$(cmp "$BACKUP/post-fork/timon.db" "$ROOT_TMP/fork-before.db" && printf ok)" "ok" "fork bytes set aside"
+assert_eq "$(cat "$BACKUP/post-fork/timon.db-wal")" "stale-wal" "wal set aside"
+assert_eq "$(cat "$BACKUP/post-fork/timon.db-shm")" "stale-shm" "shm set aside"
+assert_eq "$(stat -c %a -- "$BACKUP/post-fork/timon.db")" "600" "set-aside db mode"
+assert_eq "$(stat -c %a -- "$BACKUP/post-fork/timon.db-wal")" "600" "set-aside wal mode"
+assert_eq "$(stat -c %a -- "$BACKUP/post-fork/timon.db-shm")" "600" "set-aside shm mode"
 no_restore_leftovers
 
-# absent: a database the fork created is removed, and so is a journal left
-# behind without a main file. A dangling symlink is removed, not its target.
+# A symlink at the live path is moved aside. Its target is not chmodded
+# and is not replaced by the saved copy.
+reset_dirs
+make_original "$ROOT_TMP/official.db"
+fp=$(fork_schema_fingerprint "$ROOT_TMP/official.db")
+cp -a -- "$ROOT_TMP/official.db" "$BACKUP/db/timon.db"
+make_original "$ROOT_TMP/link-target.db"
+sqlite3 "$ROOT_TMP/link-target.db" "INSERT INTO t(note) VALUES ('through-link');"
+ln -s "$ROOT_TMP/link-target.db" "$HOME_DIR/timon.db"
+target_mode=$(stat -c %a -- "$ROOT_TMP/link-target.db")
+target_inode=$(stat -c %i -- "$ROOT_TMP/link-target.db")
+run_ok fork_maybe_restore_db "$BACKUP" timon.db "$fp"
+assert_out "timon.db set aside"
+assert_out "timon.db restored"
+assert_eq "$(sqlite3 "$HOME_DIR/timon.db" "SELECT note FROM t;")" "original" "symlink path restored"
+if [ -L "$HOME_DIR/timon.db" ]; then
+  printf 'FAIL live path is still a symlink\n' >&2
+  exit 1
+fi
+if [ ! -L "$BACKUP/post-fork/timon.db" ]; then
+  printf 'FAIL set-aside path is not the original symlink\n' >&2
+  exit 1
+fi
+assert_eq "$(stat -c %a -- "$ROOT_TMP/link-target.db")" "$target_mode" "symlink target mode"
+assert_eq "$(stat -c %i -- "$ROOT_TMP/link-target.db")" "$target_inode" "symlink target inode"
+assert_eq "$(sqlite3 "$ROOT_TMP/link-target.db" "SELECT note FROM t ORDER BY id;")" "original
+through-link" "symlink target rows"
+no_restore_leftovers
+
+# absent: a database the fork created is set aside, and so is a journal left
+# behind without a main file. A symlink is set aside, not its target.
 reset_dirs
 make_fork "$HOME_DIR/timon.db"
+cp -a -- "$HOME_DIR/timon.db" "$ROOT_TMP/absent-before.db"
 mark_journal "$HOME_DIR/timon.db"
 cp -a -- "$HOME_DIR/timon.db" "$BACKUP/db/timon.db"
 run_ok fork_maybe_restore_db "$BACKUP" timon.db absent
-assert_out "timon.db removed (absent at backup)"
+assert_out "timon.db set aside (absent at backup)"
 assert_gone "$HOME_DIR/timon.db"
 assert_gone "$HOME_DIR/timon.db-wal"
 assert_gone "$HOME_DIR/timon.db-shm"
 assert_file "$BACKUP/db/timon.db"
+assert_eq "$(cmp "$BACKUP/post-fork/timon.db" "$ROOT_TMP/absent-before.db" && printf ok)" "ok" "absent bytes set aside"
+assert_eq "$(cat "$BACKUP/post-fork/timon.db-wal")" "stale-wal" "absent wal set aside"
+assert_eq "$(stat -c %a -- "$BACKUP/post-fork/timon.db")" "600" "absent db mode"
+assert_eq "$(stat -c %a -- "$BACKUP/post-fork/timon.db-wal")" "600" "absent wal mode"
+assert_eq "$(stat -c %a -- "$BACKUP/post-fork/timon.db-shm")" "600" "absent shm mode"
 
 reset_dirs
 mark_journal "$HOME_DIR/integrations.db"
 run_ok fork_maybe_restore_db "$BACKUP" integrations.db absent
-assert_out "integrations.db removed (absent at backup)"
+assert_out "integrations.db set aside (absent at backup)"
 assert_gone "$HOME_DIR/integrations.db"
 assert_gone "$HOME_DIR/integrations.db-wal"
 assert_gone "$HOME_DIR/integrations.db-shm"
+assert_eq "$(cat "$BACKUP/post-fork/integrations.db-wal")" "stale-wal" "journal-only wal"
+assert_eq "$(cat "$BACKUP/post-fork/integrations.db-shm")" "stale-shm" "journal-only shm"
+if [ -e "$BACKUP/post-fork/integrations.db" ] || [ -L "$BACKUP/post-fork/integrations.db" ]; then
+  printf 'FAIL set aside a missing database\n' >&2
+  exit 1
+fi
 
 reset_dirs
 make_original "$ROOT_TMP/outside.db"
+outside_mode=$(stat -c %a -- "$ROOT_TMP/outside.db")
+outside_inode=$(stat -c %i -- "$ROOT_TMP/outside.db")
 ln -s "$ROOT_TMP/outside.db" "$HOME_DIR/timon.db"
 run_ok fork_maybe_restore_db "$BACKUP" timon.db absent
 assert_gone "$HOME_DIR/timon.db"
 assert_file "$ROOT_TMP/outside.db"
+if [ ! -L "$BACKUP/post-fork/timon.db" ]; then
+  printf 'FAIL absent symlink was not set aside\n' >&2
+  exit 1
+fi
+assert_eq "$(stat -c %a -- "$ROOT_TMP/outside.db")" "$outside_mode" "absent symlink target mode"
+assert_eq "$(stat -c %i -- "$ROOT_TMP/outside.db")" "$outside_inode" "absent symlink target inode"
 assert_eq "$(sqlite3 "$ROOT_TMP/outside.db" "SELECT note FROM t;")" "original" "symlink target kept"
 
 reset_dirs
@@ -289,8 +364,8 @@ expect_fail fork_maybe_restore_db "$BACKUP" other.db absent
 assert_err "refusing database name other.db"
 
 # The manifest loop: a missing saved database is restored, a database that
-# was absent at backup time is removed. A failure on the first stops before
-# the second.
+# was absent at backup time is set aside. A failure on the first stops
+# before the second.
 reset_dirs
 make_original "$HOME_DIR/timon.db"
 fp=$(fork_sqlite_backup "$HOME_DIR/timon.db" "$BACKUP/db/timon.db")
@@ -298,11 +373,13 @@ assert_eq "$(fork_schema_fingerprint "$BACKUP/db/timon.db")" "$fp" "backup finge
 rm -f -- "$HOME_DIR/timon.db"
 mark_journal "$HOME_DIR/timon.db"
 make_fork "$HOME_DIR/integrations.db"
+cp -a -- "$HOME_DIR/integrations.db" "$ROOT_TMP/loop-before.db"
 mark_journal "$HOME_DIR/integrations.db"
 write_manifest "$fp" "absent"
 run_ok fork_restore_databases "$BACKUP"
 assert_out "timon.db restored"
-assert_out "integrations.db removed (absent at backup)"
+assert_out "timon.db set aside"
+assert_out "integrations.db set aside (absent at backup)"
 assert_eq "$(sqlite3 "$HOME_DIR/timon.db" "SELECT note FROM t;")" "original" "loop restored row"
 assert_eq "$(stat -c %a -- "$HOME_DIR/timon.db")" "600" "loop restored mode"
 assert_eq "$(sqlite3 "$HOME_DIR/timon.db" "PRAGMA integrity_check;")" "ok" "loop integrity"
@@ -311,6 +388,10 @@ assert_gone "$HOME_DIR/timon.db-shm"
 assert_gone "$HOME_DIR/integrations.db"
 assert_gone "$HOME_DIR/integrations.db-wal"
 assert_gone "$HOME_DIR/integrations.db-shm"
+assert_eq "$(cat "$BACKUP/post-fork/timon.db-wal")" "stale-wal" "loop wal set aside"
+assert_eq "$(cmp "$BACKUP/post-fork/integrations.db" "$ROOT_TMP/loop-before.db" && printf ok)" "ok" "loop absent bytes"
+assert_eq "$(stat -c %a -- "$BACKUP/post-fork/integrations.db")" "600" "loop set-aside mode"
+assert_eq "$(cat "$BACKUP/post-fork/integrations.db-wal")" "stale-wal" "loop absent wal"
 no_restore_leftovers
 
 reset_dirs
@@ -861,6 +942,110 @@ if [ -e "$prep_key/src" ] || [ -e "$prep_key/stage" ]; then
 fi
 assert_eq "$(home_snapshot)" "$home_before" "fake home after planted file symlinks"
 TIMON_FORK_DATA_HOME=$old_data_home
+
+# A restore that fails after the unit was stopped must start it again.
+# The systemctl and curl on PATH are fakes. Nothing here is the real service
+# or the real Timon home.
+rb_home=$ROOT_TMP/rb-home
+rb_user=$ROOT_TMP/rb-user
+rb_backup=$ROOT_TMP/rb-backup
+mkdir -m 0700 -- "$rb_home" "$rb_user" "$rb_backup"
+old_data_home=$TIMON_FORK_DATA_HOME
+TIMON_FORK_DATA_HOME=$rb_home
+rb_unit=$(fork_unit_name)
+rb_instance=$(fork_instance_id "$rb_home")
+TIMON_FORK_DATA_HOME=$old_data_home
+mkdir -p -- "$rb_user/.config/systemd/user"
+: > "$rb_user/.config/systemd/user/${rb_unit}.service"
+jq -n --arg unit "$rb_unit" --arg port "9" --arg active "0.1.8-test" \
+  '{unit: $unit, port: $port, activeRelease: $active}' > "$rb_backup/manifest.json"
+
+export FORK_TEST_CURL_COUNT="$ROOT_TMP/curl-count"
+export FORK_TEST_CURL_LOG="$ROOT_TMP/curl.log"
+export FORK_TEST_HEALTH_BODY="{\"ok\":true,\"service\":\"timon\",\"instance\":\"${rb_instance}\"}"
+printf '0\n' > "$FORK_TEST_CURL_COUNT"
+: > "$FORK_TEST_CURL_LOG"
+if [ -s "$FORK_TEST_SYSTEMCTL_LOG" ]; then
+  printf 'FAIL systemctl was called before the rollback test\n' >&2
+  cat "$FORK_TEST_SYSTEMCTL_LOG" >&2
+  exit 1
+fi
+: > "$FORK_TEST_SYSTEMCTL_LOG"
+cat > "$ROOT_TMP/bin/curl" << 'EOF'
+#!/bin/sh
+n=$(cat "$FORK_TEST_CURL_COUNT")
+n=$((n + 1))
+printf '%s\n' "$n" > "$FORK_TEST_CURL_COUNT"
+printf '%s\n' "$*" >> "$FORK_TEST_CURL_LOG"
+if [ "$n" -le 2 ]; then
+  exit 1
+fi
+printf '%s\n' "$FORK_TEST_HEALTH_BODY"
+exit 0
+EOF
+chmod 755 "$ROOT_TMP/bin/curl"
+cat > "$ROOT_TMP/bin/systemctl" << 'EOF'
+#!/bin/sh
+printf '%s\n' "$*" >> "$FORK_TEST_SYSTEMCTL_LOG"
+exit 0
+EOF
+chmod 755 "$ROOT_TMP/bin/systemctl"
+
+set +e
+HOME=$rb_user TIMON_FORK_DATA_HOME=$rb_home \
+  "$ROOT/rollback.sh" --backup "$rb_backup" --apply > "$ROOT_TMP/out" 2> "$ROOT_TMP/err"
+rb_status=$?
+set -e
+if [ "$rb_status" -eq 0 ]; then
+  printf 'FAIL rollback succeeded after a missing unit backup\n' >&2
+  cat "$ROOT_TMP/out" >&2
+  cat "$ROOT_TMP/err" >&2
+  exit 1
+fi
+assert_err "could not restore the unit file"
+assert_err "the unit was stopped and the restore did not finish"
+assert_err "unit file not restored"
+assert_err "active-release not restored"
+assert_err "release not restored"
+assert_err "databases not restored"
+assert_err "is answering on port 9"
+assert_err "the saved copy was not fully restored"
+assert_eq "$(sed -n '1p' "$FORK_TEST_SYSTEMCTL_LOG")" "--user stop $rb_unit" "systemctl stop"
+assert_eq "$(sed -n '2p' "$FORK_TEST_SYSTEMCTL_LOG")" "--user start $rb_unit" "systemctl start"
+if [ "$(wc -l < "$FORK_TEST_SYSTEMCTL_LOG" | tr -d ' ')" != "2" ]; then
+  printf 'FAIL unexpected systemctl calls\n' >&2
+  cat "$FORK_TEST_SYSTEMCTL_LOG" >&2
+  exit 1
+fi
+case "$rb_home" in
+  "$ROOT_TMP"/*) ;;
+  *)
+    printf 'FAIL rollback data home left the temp dir\n' >&2
+    exit 1
+    ;;
+esac
+case "$rb_user" in
+  "$ROOT_TMP"/*) ;;
+  *)
+    printf 'FAIL rollback user home left the temp dir\n' >&2
+    exit 1
+    ;;
+esac
+case "$rb_home" in
+  "$HOME/.timon"|"$HOME/.timon"/*)
+    printf 'FAIL rollback home is the live Timon home\n' >&2
+    exit 1
+    ;;
+esac
+
+rm -f -- "$ROOT_TMP/bin/curl"
+cat > "$ROOT_TMP/bin/systemctl" << 'EOF'
+#!/bin/sh
+printf '%s\n' "$*" >> "$FORK_TEST_SYSTEMCTL_LOG"
+exit 99
+EOF
+chmod 755 "$ROOT_TMP/bin/systemctl"
+: > "$FORK_TEST_SYSTEMCTL_LOG"
 
 if [ -s "$FORK_TEST_SYSTEMCTL_LOG" ]; then
   printf 'FAIL systemctl was called\n' >&2

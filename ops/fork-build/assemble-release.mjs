@@ -473,7 +473,7 @@ assertNoEscapingSymlink(outputInput, outputNow);
 assertOutside(outputNow, liveHome(), 'output');
 if (outputNow !== output) throw new Error(`output path changed (${outputNow})`);
 if (existsSync(outputNow)) throw new Error(`output already exists: ${outputNow}`);
-run('cp', ['-a', shell, outputNow]);
+run('cp', ['-a', shell, outputNow]); // portability: VPS-only fork tooling (Linux, systemd user unit)
 const outputId = identityOf(outputNow);
 const orch = join(outputNow, 'resources', 'orchestrator');
 const replaced = ['dist', 'bin', 'presets', 'scripts', 'builtin-plugins', 'builtin-plugins.json', 'package.json', 'build-info.json', 'public-docs', 'native', 'release-manifest.json', 'release-manifest.sig'];
