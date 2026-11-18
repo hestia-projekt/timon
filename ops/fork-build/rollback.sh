@@ -36,6 +36,10 @@ if [ "$APPLY" -eq 1 ]; then
   fork_acquire_apply_lock
 fi
 
+# Before the port is probed and before any stop or write. A backup made for
+# another home, or one that does not record its home, stops here.
+fork_backup_matches_home "$BACKUP" || exit 1
+
 UNIT_FILE=$(fork_unit_file)
 UNIT_NAME=$(fork_unit_name)
 UNIT_HOME=$(fork_unit_home "$UNIT_FILE")

@@ -39,7 +39,14 @@ HOME_DIR=$(fork_home)
 UNIT_NAME=$(fork_unit_name)
 UNIT_FILE=$(fork_unit_file)
 PORT=$(fork_port_from_unit "$UNIT_FILE")
-VERSION_ID=$(node --input-type=module -e 'import { readFileSync } from "node:fs"; const body = JSON.parse(readFileSync(process.argv[1], "utf8")); if (!body.versionId) process.exit(1); process.stdout.write(body.versionId);' "$PACKAGE/fork-build.json")
+# The unit we would stop must already be this home. Otherwise the backup taken
+# after the stop could not be restored onto it.
+UNIT_HOME_RAW=$(sed -n 's/^Environment="TIMON_HOME=\([^"]*\)".*/\1/p' "$UNIT_FILE" | head -n 1) # portability: VPS-only fork tooling (Linux, systemd user unit)
+[ -n "$UNIT_HOME_RAW" ] || fork_die "unit file has no TIMON_HOME"
+if [ "$(fork_canonical_path "$UNIT_HOME_RAW")" != "$(fork_canonical_path "$HOME_DIR")" ] || [ "$(fork_instance_id "$UNIT_HOME_RAW")" != "$(fork_instance_id "$HOME_DIR")" ]; then
+  fork_die "unit TIMON_HOME does not match this home"
+fi
+VERSION_ID=$(node --input-type=module -e 'import { readFileSync } from "node:fs"; const body = JSON.parse(readFileSync(process.argv[1], "utf8")); if (!body || typeof body.versionId !== "string" || body.versionId === "") process.exit(1); process.stdout.write(body.versionId);' "$PACKAGE/fork-build.json")
 fork_version_id_ok "$VERSION_ID"
 ACTIVE=$(tr -d '[:space:]' < "$HOME_DIR/desktop-runtime/active-release")
 fork_version_id_ok "$ACTIVE"
@@ -163,15 +170,21 @@ cp -a -- "$UNIT_FILE" "$unit_backup" # portability: VPS-only fork tooling (Linux
 active_backup=$(fork_confine_file "$DEST/active-release" "$DEST" "active-release backup") || exit 1
 cp -a -- "$HOME_DIR/desktop-runtime/active-release" "$active_backup" # portability: VPS-only fork tooling (Linux, systemd user unit)
 manifest=$(fork_confine_file "$DEST/manifest.json" "$DEST" "backup manifest") || exit 1
+# home is the canonical path. instance is sha256(path.resolve(home))[0:24],
+# the same derivation as the daemon. Restore refuses a manifest without them.
+BACKUP_HOME=$(fork_canonical_path "$HOME_DIR")
+BACKUP_INSTANCE=$(fork_instance_id "$HOME_DIR")
 jq -n \
   --arg stamp "$STAMP" \
+  --arg home "$BACKUP_HOME" \
+  --arg instance "$BACKUP_INSTANCE" \
   --arg unit "$UNIT_NAME" \
   --arg port "$PORT" \
   --arg active "$ACTIVE" \
   --arg package "$VERSION_ID" \
   --arg timon "$FP_TIMON" \
   --arg integrations "$FP_INTEGRATIONS" \
-  '{stamp: $stamp, unit: $unit, port: $port, activeRelease: $active, packageVersionId: $package, databases: {"timon.db": {fingerprint: $timon}, "integrations.db": {fingerprint: $integrations}}}' \
+  '{stamp: $stamp, home: $home, instance: $instance, unit: $unit, port: $port, activeRelease: $active, packageVersionId: $package, databases: {"timon.db": {fingerprint: $timon}, "integrations.db": {fingerprint: $integrations}}}' \
   > "$manifest"
 fork_privatize_tree "$DEST"
 for db_name in timon.db integrations.db; do

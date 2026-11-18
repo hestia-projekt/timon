@@ -1014,11 +1014,22 @@ old_data_home=$TIMON_FORK_DATA_HOME
 TIMON_FORK_DATA_HOME=$rb_home
 rb_unit=$(fork_unit_name)
 rb_instance=$(fork_instance_id "$rb_home")
+rb_canon=$(fork_canonical_path "$rb_home")
 TIMON_FORK_DATA_HOME=$old_data_home
-mkdir -p -- "$rb_user/.config/systemd/user"
+mkdir -p -- "$rb_user/.config/systemd/user" "$rb_home/desktop-runtime"
 : > "$rb_user/.config/systemd/user/${rb_unit}.service"
-jq -n --arg unit "$rb_unit" --arg port "9" --arg active "0.1.8-test" \
-  '{unit: $unit, port: $port, activeRelease: $active}' > "$rb_backup/manifest.json"
+# Identity matches this home, so the stop is allowed. The official tree is
+# missing, which fails after the stop and must start the unit again.
+jq -n \
+  --arg home "$rb_canon" \
+  --arg instance "$rb_instance" \
+  --arg unit "$rb_unit" \
+  --arg port "9" \
+  --arg active "0.1.8-test" \
+  '{home: $home, instance: $instance, unit: $unit, port: $port, activeRelease: $active, databases: {"timon.db": {fingerprint: "absent"}, "integrations.db": {fingerprint: "absent"}}}' \
+  > "$rb_backup/manifest.json"
+printf 'Environment="TIMON_HOME=%s"\nEnvironment="PORT=9"\n' "$rb_home" > "$rb_backup/unit.service"
+printf '0.1.8-test\n' > "$rb_backup/active-release"
 
 export FORK_TEST_CURL_COUNT="$ROOT_TMP/curl-count"
 export FORK_TEST_CURL_LOG="$ROOT_TMP/curl.log"
@@ -1062,10 +1073,10 @@ if [ "$rb_status" -eq 0 ]; then
   cat "$ROOT_TMP/err" >&2
   exit 1
 fi
-assert_err "could not restore the unit file"
+assert_err "could not restore official release"
 assert_err "the unit was stopped and the restore did not finish"
-assert_err "unit file not restored"
-assert_err "active-release not restored"
+assert_err "unit file restored"
+assert_err "active-release restored"
 assert_err "release not restored"
 assert_err "databases not restored"
 assert_err "is answering on port 9"
@@ -1106,6 +1117,169 @@ exit 99
 EOF
 chmod 755 "$ROOT_TMP/bin/systemctl"
 : > "$FORK_TEST_SYSTEMCTL_LOG"
+
+# A version id is one path segment. A newline must not become a second path.
+if fork_version_id_safe "$(printf '0.1.8\n../outside')"; then
+  printf 'FAIL a version id with a newline was accepted\n' >&2
+  exit 1
+fi
+if ! fork_version_id_safe "0.1.8-fork.abc"; then
+  printf 'FAIL a normal version id was refused\n' >&2
+  exit 1
+fi
+if fork_port_safe "9;reboot" || fork_port_safe "0" || fork_port_safe "65536"; then
+  printf 'FAIL a bad port was accepted\n' >&2
+  exit 1
+fi
+if ! fork_port_safe "9" || ! fork_port_safe "65535"; then
+  printf 'FAIL a usable port was refused\n' >&2
+  exit 1
+fi
+
+# Backup of home A restored onto home B: refuse before any stop or write.
+# systemctl is the fake above. Both homes are disposable.
+a_home=$ROOT_TMP/home-a
+b_home=$ROOT_TMP/home-b
+b_user=$ROOT_TMP/user-b
+a_backup=$ROOT_TMP/backup-a
+mkdir -m 0700 -- "$a_home" "$b_home" "$b_user" "$a_backup"
+mkdir -p -- "$b_home/desktop-runtime" "$b_user/.config/systemd/user"
+saved_home_for_ab=$TIMON_FORK_DATA_HOME
+TIMON_FORK_DATA_HOME=$a_home
+a_unit=$(fork_unit_name)
+a_instance=$(fork_instance_id "$a_home")
+a_canon=$(fork_canonical_path "$a_home")
+TIMON_FORK_DATA_HOME=$b_home
+b_unit=$(fork_unit_name)
+b_instance=$(fork_instance_id "$b_home")
+b_canon=$(fork_canonical_path "$b_home")
+TIMON_FORK_DATA_HOME=$saved_home_for_ab
+printf 'Environment="TIMON_HOME=%s"\nEnvironment="PORT=9"\n' "$b_home" > "$b_user/.config/systemd/user/${b_unit}.service"
+printf 'live-b\n' > "$b_home/desktop-runtime/active-release"
+printf 'db-b\n' > "$b_home/timon.db"
+printf 'db-b-i\n' > "$b_home/integrations.db"
+b_unit_before=$(cat "$b_user/.config/systemd/user/${b_unit}.service")
+b_release_before=$(cat "$b_home/desktop-runtime/active-release")
+b_db_before=$(cat "$b_home/timon.db")
+b_dbi_before=$(cat "$b_home/integrations.db")
+printf 'Environment="TIMON_HOME=%s"\nEnvironment="PORT=9"\n' "$a_home" > "$a_backup/unit.service"
+printf '0.1.8-a\n' > "$a_backup/active-release"
+jq -n \
+  --arg home "$a_canon" \
+  --arg instance "$a_instance" \
+  --arg unit "$a_unit" \
+  --arg port "9" \
+  --arg active "0.1.8-a" \
+  '{home: $home, instance: $instance, unit: $unit, port: $port, activeRelease: $active, databases: {"timon.db": {fingerprint: "absent"}, "integrations.db": {fingerprint: "absent"}}}' \
+  > "$a_backup/manifest.json"
+: > "$FORK_TEST_SYSTEMCTL_LOG"
+set +e
+HOME=$b_user TIMON_FORK_DATA_HOME=$b_home \
+  "$ROOT/rollback.sh" --backup "$a_backup" --apply > "$ROOT_TMP/out" 2> "$ROOT_TMP/err"
+ab_status=$?
+set -e
+if [ "$ab_status" -eq 0 ]; then
+  printf 'FAIL rollback of home A onto home B succeeded\n' >&2
+  cat "$ROOT_TMP/out" >&2
+  cat "$ROOT_TMP/err" >&2
+  exit 1
+fi
+assert_err "backup was made for a different home"
+if [ -s "$FORK_TEST_SYSTEMCTL_LOG" ]; then
+  printf 'FAIL systemctl ran while refusing a foreign backup\n' >&2
+  cat "$FORK_TEST_SYSTEMCTL_LOG" >&2
+  exit 1
+fi
+assert_eq "$(cat "$b_user/.config/systemd/user/${b_unit}.service")" "$b_unit_before" "unit B after foreign rollback"
+assert_eq "$(cat "$b_home/desktop-runtime/active-release")" "$b_release_before" "release B after foreign rollback"
+assert_eq "$(cat "$b_home/timon.db")" "$b_db_before" "timon.db B after foreign rollback"
+assert_eq "$(cat "$b_home/integrations.db")" "$b_dbi_before" "integrations.db B after foreign rollback"
+# install.sh rolls back through the same function, not through rollback.sh.
+TIMON_FORK_DATA_HOME=$b_home
+expect_fail fork_restore_backup "$a_backup"
+TIMON_FORK_DATA_HOME=$saved_home_for_ab
+assert_err "backup was made for a different home"
+if [ -s "$FORK_TEST_SYSTEMCTL_LOG" ]; then
+  printf 'FAIL systemctl ran while fork_restore_backup refused a foreign backup\n' >&2
+  cat "$FORK_TEST_SYSTEMCTL_LOG" >&2
+  exit 1
+fi
+assert_eq "$(cat "$b_user/.config/systemd/user/${b_unit}.service")" "$b_unit_before" "unit B after foreign restore"
+assert_eq "$(cat "$b_home/timon.db")" "$b_db_before" "timon.db B after foreign restore"
+
+# An old manifest has a unit and a port, and no home or instance.
+old_backup=$ROOT_TMP/backup-old
+mkdir -m 0700 -- "$old_backup"
+jq -n --arg unit "$b_unit" --arg port "9" --arg active "0.1.8-test" \
+  '{unit: $unit, port: $port, activeRelease: $active}' > "$old_backup/manifest.json"
+: > "$FORK_TEST_SYSTEMCTL_LOG"
+set +e
+HOME=$b_user TIMON_FORK_DATA_HOME=$b_home \
+  "$ROOT/rollback.sh" --backup "$old_backup" --apply > "$ROOT_TMP/out" 2> "$ROOT_TMP/err"
+old_status=$?
+set -e
+if [ "$old_status" -eq 0 ]; then
+  printf 'FAIL an old backup was restored\n' >&2
+  exit 1
+fi
+assert_err "make a new backup"
+if [ -s "$FORK_TEST_SYSTEMCTL_LOG" ]; then
+  printf 'FAIL systemctl ran while refusing an old backup\n' >&2
+  cat "$FORK_TEST_SYSTEMCTL_LOG" >&2
+  exit 1
+fi
+assert_eq "$(cat "$b_user/.config/systemd/user/${b_unit}.service")" "$b_unit_before" "unit B after old backup"
+assert_eq "$(cat "$b_home/desktop-runtime/active-release")" "$b_release_before" "release B after old backup"
+assert_eq "$(cat "$b_home/timon.db")" "$b_db_before" "timon.db B after old backup"
+assert_eq "$(cat "$b_home/integrations.db")" "$b_dbi_before" "integrations.db B after old backup"
+
+# The three manifest fields name home B, but the saved unit file is home A's.
+# Refuse before stop. The files of B stay as they were.
+tamper=$ROOT_TMP/backup-tamper
+mkdir -m 0700 -- "$tamper"
+jq -n \
+  --arg home "$b_canon" \
+  --arg instance "$b_instance" \
+  --arg unit "$b_unit" \
+  --arg port "9" \
+  --arg active "0.1.8-test" \
+  '{home: $home, instance: $instance, unit: $unit, port: $port, activeRelease: $active, databases: {"timon.db": {fingerprint: "absent"}, "integrations.db": {fingerprint: "absent"}}}' \
+  > "$tamper/manifest.json"
+printf 'Environment="TIMON_HOME=%s"\nEnvironment="PORT=9"\n' "$a_home" > "$tamper/unit.service"
+printf '0.1.8-test\n' > "$tamper/active-release"
+: > "$FORK_TEST_SYSTEMCTL_LOG"
+set +e
+HOME=$b_user TIMON_FORK_DATA_HOME=$b_home \
+  "$ROOT/rollback.sh" --backup "$tamper" --apply > "$ROOT_TMP/out" 2> "$ROOT_TMP/err"
+tamper_status=$?
+set -e
+if [ "$tamper_status" -eq 0 ]; then
+  printf 'FAIL a unit file for another home was restored\n' >&2
+  exit 1
+fi
+assert_err "backup unit file does not match this home"
+if [ -s "$FORK_TEST_SYSTEMCTL_LOG" ]; then
+  printf 'FAIL systemctl ran while refusing a foreign unit file\n' >&2
+  cat "$FORK_TEST_SYSTEMCTL_LOG" >&2
+  exit 1
+fi
+assert_eq "$(cat "$b_user/.config/systemd/user/${b_unit}.service")" "$b_unit_before" "unit B after tampered unit"
+assert_eq "$(cat "$b_home/desktop-runtime/active-release")" "$b_release_before" "release B after tampered unit"
+assert_eq "$(cat "$b_home/timon.db")" "$b_db_before" "timon.db B after tampered unit"
+assert_eq "$(cat "$b_home/integrations.db")" "$b_dbi_before" "integrations.db B after tampered unit"
+case "$a_home" in
+  "$ROOT_TMP"/*) ;;
+  *)
+    printf 'FAIL home A left the temp dir\n' >&2
+    exit 1
+    ;;
+esac
+case "$b_home" in
+  "$HOME/.timon"|"$HOME/.timon"/*)
+    printf 'FAIL home B is the live Timon home\n' >&2
+    exit 1
+    ;;
+esac
 
 # Two processes in the same second must not share a backup directory name.
 sh -c '. "$1"; fork_backup_stamp' sh "$ROOT/lib.sh" > "$ROOT_TMP/stamp1" &
@@ -1187,7 +1361,7 @@ while [ ! -s "$ROOT_TMP/hang-port" ]; do
   sleep 0.1
 done
 hang_port=$(cat "$ROOT_TMP/hang-port")
-printf 'Environment="PORT=%s"\n' "$hang_port" > "$lock_user/.config/systemd/user/${lock_unit}.service"
+printf 'Environment="TIMON_HOME=%s"\nEnvironment="PORT=%s"\n' "$lock_home" "$hang_port" > "$lock_user/.config/systemd/user/${lock_unit}.service"
 lock_dir=$(dirname -- "$(realpath -m -- "$lock_home")")/timon-fork-locks
 lock_file=$lock_dir/$lock_unit.lock
 case "$lock_dir" in

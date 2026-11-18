@@ -70,7 +70,8 @@ Avec `--apply`, dans l'ordre :
    - `timon.db` et `integrations.db` par `sqlite3 .backup`, puis `PRAGMA integrity_check` ;
    - le reste du dossier, sauf le runtime, les worktrees, les caches et les bases (une copie à chaud du fichier SQLite n'est pas utilisée) ; un second `rsync` à blanc doit être vide ;
    - une copie de la release officielle courante, vérifiée par le SHA-256 de `release-manifest.json` et le nombre de fichiers ;
-   - l'unité systemd et le pointeur `active-release` tels qu'ils étaient.
+   - l'unité systemd et le pointeur `active-release` tels qu'ils étaient ;
+   - `manifest.json`, avec le home canonique (`realpath`), l'`instance` (les 24 premiers caractères hexadécimaux du SHA-256 de `path.resolve` du home, comme `instanceId` du démon) et le nom d'unité.
 6. Il copie le paquet dans `desktop-runtime/releases/<id>/`, réécrit les chemins de l'unité (les drop-ins, dont le port de l'application, ne sont pas touchés), pose le pointeur, recharge systemd et redémarre l'unité.
 7. Il attend `/api/health` (`instance` est celle du home visé, `service` vaut `timon`, pas d'attente d'approbation). Une autre instance sur le port est un échec. Si le redémarrage ou la santé échoue, il exécute le retour arrière décrit plus bas, puis retire la copie du paquet. Si ce retour arrière échoue à son tour, l'unité dont les fichiers viennent d'être remis est tout de même relancée.
 
@@ -103,6 +104,8 @@ ops/fork-build/rollback.sh --backup ~/timon-fork-backups/<date>-<pid> --apply
 ```
 
 `--backup` est canonique. Le dossier est refusé s'il est `~/.timon`, s'il s'y trouve, s'il n'appartient pas à l'utilisateur courant, ou s'il n'est pas déjà en `0700`. Le script ne change pas ses droits.
+
+Avant toute sonde du port, tout arrêt et toute écriture, le script compare trois champs du manifeste au home visé : le chemin canonique, l'instance, et le nom d'unité. Un écart est un refus, et rien n'est modifié. Une sauvegarde ancienne, sans ces champs, est refusée : il faut refaire une sauvegarde. Le fichier d'unité sauvegardé (`TIMON_HOME` et port), le pointeur `active-release`, le nom de release et les empreintes de bases sont contrôlés de la même façon. Un lien symbolique à la place de ces fichiers est un refus. Le nom de release lu d'un paquet (`fork-build.json`) est un seul segment de chemin : une autre forme est refusée avant la copie.
 
 Avec `--apply` : si le démon répond, le script refuse tant qu'une mission tourne. Il relit la liste une seconde fois, juste avant l'arrêt (voir [Bascule](#bascule)). La restauration suit cet ordre :
 

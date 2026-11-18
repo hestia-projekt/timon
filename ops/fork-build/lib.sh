@@ -413,12 +413,44 @@ fork_existing_dir() {
   printf '%s\n' "$fed_target"
 }
 
+# One path segment. A newline or a slash would make one recorded name into
+# two paths; grep would accept the first line and ignore the rest.
 fork_version_id_safe() {
-  printf '%s' "$1" | grep -Eq '^[0-9A-Za-z._-]{1,80}$' || return 1
+  [ -n "$1" ] || return 1
+  [ "${#1}" -le 80 ] || return 1
   case "$1" in
     .|..) return 1 ;;
+    *[!0-9A-Za-z._-]*) return 1 ;;
   esac
   return 0
+}
+
+# A TCP port, decimal, with no other characters. Leading zeros are not a
+# different port: 09 is 9, and 0 is not a port.
+fork_port_safe() {
+  case "$1" in
+    ''|*[!0-9]*) return 1 ;;
+  esac
+  fps=$1
+  while :; do
+    case "$fps" in
+      0*) fps=${fps#0} ;;
+      *) break ;;
+    esac
+  done
+  [ -n "$fps" ] || return 1
+  [ "${#fps}" -le 5 ] || return 1
+  [ "$fps" -ge 1 ] && [ "$fps" -le 65535 ]
+}
+
+# Schema fingerprint stored in a backup manifest: the word absent, or 64 hex
+# digits. Anything else is not a fingerprint this restore knows how to check.
+fork_fingerprint_safe() {
+  case "$1" in
+    absent) return 0 ;;
+    *[!0-9a-f]*) return 1 ;;
+  esac
+  [ "${#1}" -eq 64 ]
 }
 
 fork_version_id_ok() {
@@ -1019,6 +1051,156 @@ fork_maybe_restore_db() {
   printf '%s restored\n' "$name"
 }
 
+# The first line of a regular file, without a trailing CR. A second line, a
+# symlink, or a missing file is a failure: the caller must not act on it.
+# Prints the line. Nothing is written.
+fork_one_line_file() {
+  fol_path=$1
+  fol_label=$2
+  if [ -L "$fol_path" ]; then
+    printf 'fork-build: refusing to follow symlink %s\n' "$fol_path" >&2
+    return 1
+  fi
+  if [ ! -f "$fol_path" ]; then
+    printf 'fork-build: backup %s is missing\n' "$fol_label" >&2
+    return 1
+  fi
+  fol_line=$(sed -n '1p' "$fol_path" | tr -d '\r') || { # portability: VPS-only fork tooling (Linux, systemd user unit)
+    printf 'fork-build: cannot read %s\n' "$fol_path" >&2
+    return 1
+  }
+  fol_rest=$(sed -n '2,$p' "$fol_path") || { # portability: VPS-only fork tooling (Linux, systemd user unit)
+    printf 'fork-build: cannot read %s\n' "$fol_path" >&2
+    return 1
+  }
+  if [ -n "$fol_rest" ]; then
+    printf 'fork-build: backup %s has more than one line\n' "$fol_label" >&2
+    return 1
+  fi
+  printf '%s\n' "$fol_line"
+}
+
+# A backup may be restored only onto the home it was taken from.
+# Compares the manifest's canonical home, instance, and unit name with the
+# home this process is targeting. Then checks the saved unit file, the port,
+# the release name, and the database fingerprints: those values choose what
+# is stopped and what is written. A symlink in place of a saved file is refused.
+# An old manifest that does not record home, instance, and unit is refused.
+# Does not stop a unit and does not write. Returns 1 on refusal.
+fork_backup_matches_home() {
+  fbm_dest=$1
+  fbm_manifest=$fbm_dest/manifest.json
+  if [ ! -f "$fbm_manifest" ] || [ -L "$fbm_manifest" ]; then
+    printf 'fork-build: no manifest in %s\n' "$fbm_dest" >&2
+    return 1
+  fi
+  fbm_home=$(jq -r '.home // empty' "$fbm_manifest") || {
+    printf 'fork-build: cannot read %s\n' "$fbm_manifest" >&2
+    return 1
+  }
+  fbm_instance=$(jq -r '.instance // empty' "$fbm_manifest") || {
+    printf 'fork-build: cannot read %s\n' "$fbm_manifest" >&2
+    return 1
+  }
+  fbm_unit=$(jq -r '.unit // empty' "$fbm_manifest") || {
+    printf 'fork-build: cannot read %s\n' "$fbm_manifest" >&2
+    return 1
+  }
+  if [ -z "$fbm_home" ] || [ -z "$fbm_instance" ] || [ -z "$fbm_unit" ]; then
+    printf 'fork-build: backup has no home, instance, or unit; make a new backup\n' >&2
+    return 1
+  fi
+  fbm_target=$(fork_canonical_path "$(fork_home)") || return 1
+  fbm_target_instance=$(fork_instance_id "$(fork_home)") || return 1
+  fbm_target_unit=$(fork_unit_name) || return 1
+  if [ "$fbm_home" != "$fbm_target" ] || [ "$fbm_instance" != "$fbm_target_instance" ] || [ "$fbm_unit" != "$fbm_target_unit" ]; then
+    printf 'fork-build: backup was made for a different home\n' >&2
+    return 1
+  fi
+
+  fbm_port=$(jq -r '.port // empty' "$fbm_manifest") || {
+    printf 'fork-build: cannot read %s\n' "$fbm_manifest" >&2
+    return 1
+  }
+  fbm_active=$(jq -r '.activeRelease // empty' "$fbm_manifest") || {
+    printf 'fork-build: cannot read %s\n' "$fbm_manifest" >&2
+    return 1
+  }
+  if [ -z "$fbm_port" ] || [ -z "$fbm_active" ]; then
+    printf 'fork-build: backup manifest has no port or release; make a new backup\n' >&2
+    return 1
+  fi
+  if ! fork_port_safe "$fbm_port"; then
+    printf 'fork-build: backup manifest port is not usable\n' >&2
+    return 1
+  fi
+  if ! fork_version_id_safe "$fbm_active"; then
+    printf 'fork-build: refusing version id %s\n' "$fbm_active" >&2
+    return 1
+  fi
+  # The release directory this restore would write. A symlink parent that
+  # leaves the home is refused before anything is stopped.
+  fbm_release="$(fork_home)/desktop-runtime/releases/$fbm_active"
+  fbm_release_canon=$(fork_canonical_path "$fbm_release") || return 1
+  case "$fbm_release_canon" in
+    "$fbm_target"/desktop-runtime/releases/"$fbm_active") ;;
+    *)
+      printf 'fork-build: refusing release path %s\n' "$fbm_release_canon" >&2
+      return 1
+      ;;
+  esac
+
+  fbm_saved_unit=$fbm_dest/unit.service
+  if [ -L "$fbm_saved_unit" ]; then
+    printf 'fork-build: refusing to follow symlink %s\n' "$fbm_saved_unit" >&2
+    return 1
+  fi
+  if [ ! -f "$fbm_saved_unit" ]; then
+    printf 'fork-build: backup unit file is missing\n' >&2
+    return 1
+  fi
+  fbm_unit_home=$(sed -n 's/^Environment="TIMON_HOME=\([^"]*\)".*/\1/p' "$fbm_saved_unit" | head -n 1) # portability: VPS-only fork tooling (Linux, systemd user unit)
+  if [ -z "$fbm_unit_home" ]; then
+    printf 'fork-build: backup unit file has no TIMON_HOME\n' >&2
+    return 1
+  fi
+  fbm_unit_canon=$(fork_canonical_path "$fbm_unit_home") || return 1
+  fbm_unit_instance=$(fork_instance_id "$fbm_unit_home") || return 1
+  if [ "$fbm_unit_canon" != "$fbm_target" ] || [ "$fbm_unit_instance" != "$fbm_target_instance" ]; then
+    printf 'fork-build: backup unit file does not match this home\n' >&2
+    return 1
+  fi
+  fbm_unit_port=$(sed -n 's/^Environment="PORT=\([0-9][0-9]*\)".*/\1/p' "$fbm_saved_unit" | head -n 1) # portability: VPS-only fork tooling (Linux, systemd user unit)
+  if [ "$fbm_unit_port" != "$fbm_port" ]; then
+    printf 'fork-build: backup unit port does not match the manifest\n' >&2
+    return 1
+  fi
+
+  fbm_pointer=$(fork_one_line_file "$fbm_dest/active-release" "active-release") || return 1
+  if [ "$fbm_pointer" != "$fbm_active" ]; then
+    printf 'fork-build: backup active-release does not match the manifest\n' >&2
+    return 1
+  fi
+  if [ -L "$fbm_dest/official-release" ]; then
+    printf 'fork-build: refusing to follow symlink %s\n' "$fbm_dest/official-release" >&2
+    return 1
+  fi
+
+  fbm_timon=$(jq -r '.databases["timon.db"].fingerprint // empty' "$fbm_manifest") || {
+    printf 'fork-build: cannot read %s\n' "$fbm_manifest" >&2
+    return 1
+  }
+  fbm_integrations=$(jq -r '.databases["integrations.db"].fingerprint // empty' "$fbm_manifest") || {
+    printf 'fork-build: cannot read %s\n' "$fbm_manifest" >&2
+    return 1
+  }
+  if ! fork_fingerprint_safe "$fbm_timon" || ! fork_fingerprint_safe "$fbm_integrations"; then
+    printf 'fork-build: backup manifest has no usable database fingerprint; make a new backup\n' >&2
+    return 1
+  fi
+  return 0
+}
+
 # Read the two fingerprints from the backup manifest and restore each one.
 # The second database is left untouched when the first restore fails.
 fork_restore_databases() {
@@ -1038,11 +1220,13 @@ fork_restore_databases() {
 # Stop the service, put the saved unit and pointer back, put the official
 # release tree back when its runner is gone, put the databases back, then
 # start again and wait for health.
-# Returns 1 on failure and does not exit the shell, except the "recheck"
-# argument: that path exits before the stop when a mission is running.
-# install.sh calls this from `if`, where dash ignores set -e, so each step
-# checks its own status. The caller can then start the unit that this
-# function has already put back. The failure path does not pass "recheck".
+# The backup is checked against this home before the recheck, the stop, and
+# any write. A different home, or an old manifest, returns 1 with nothing
+# changed. Returns 1 on failure and does not exit the shell, except the
+# "recheck" argument: that path exits before the stop when a mission is
+# running. install.sh calls this from `if`, where dash ignores set -e, so
+# each step checks its own status. The caller can then start the unit that
+# this function has already put back. The failure path does not pass "recheck".
 #
 # rollback.sh reads the fork_restore_* flags from its EXIT trap. They stay
 # 0 until the matching step has finished. fork_restore_stopped is 1 only
@@ -1058,8 +1242,8 @@ fork_restore_backup() {
   fork_restore_pointer=0
   fork_restore_release=0
   fork_restore_dbs=0
-  if [ ! -f "$dest/manifest.json" ]; then
-    printf 'fork-build: no manifest in %s\n' "$dest" >&2
+  # Before the port is used, before the unit is stopped, and before any copy.
+  if ! fork_backup_matches_home "$dest"; then
     return 1
   fi
   unit=$(jq -r '.unit' "$dest/manifest.json") || {
