@@ -122,18 +122,22 @@ fork_confine_file() {
 }
 
 # The Ed25519 pair for this build, in a directory this run confined.
-# An existing regular private key is kept. A symlink, or any other
+# That directory must already belong to this user and be mode 0700.
+# An existing pair is kept only when each file is a regular file owned by
+# this user: the private key mode 0600, the public key mode 0600 or 0644.
+# A looser mode is refused and left as it is. Generate a new pair; do not
+# chmod a key that may already have been copied. A symlink, or any other
 # non-file, is refused: openssl -out would follow it. A new pair is written
 # under umask 077 to temporary files in the same directory, checked, then
 # renamed into place. rename does not follow a symlink at the destination.
 fork_ensure_release_keys() {
   fek_dir=$1
-  if [ -L "$fek_dir" ] || [ ! -d "$fek_dir" ]; then
-    fork_die "release key directory is not a directory: $fek_dir"
-  fi
+  fork_require_private_dir "$fek_dir" "release key directory"
   fek_priv=$(fork_confine_file "$fek_dir/fork-release.key.pem" "$fek_dir" "release key") || exit 1
   fek_pub=$(fork_confine_file "$fek_dir/fork-release.pub.pem" "$fek_dir" "release public key") || exit 1
-  if [ -e "$fek_priv" ]; then
+  if [ -e "$fek_priv" ] || [ -e "$fek_pub" ]; then
+    fork_require_key_file "$fek_priv" "release key" "600" 600
+    fork_require_key_file "$fek_pub" "release public key" "600 or 644" 600 644
     return 0
   fi
   fek_umask=$(umask)
@@ -301,6 +305,96 @@ fork_require_private_dir() {
   fi
   if [ "$frp_mode" != "700" ]; then
     fork_die "$frp_label $frp_target is mode $frp_mode, expected 700 (not changing it)"
+  fi
+}
+
+# An existing signing key. It must be a regular file owned by this user,
+# with a mode in the allowed list. Never chmod it: a copied key with a
+# loose mode may already have been read, so the caller regenerates the pair.
+fork_require_key_file() {
+  frk_path=$1
+  frk_label=$2
+  frk_expected=$3
+  shift 3
+  if [ ! -e "$frk_path" ]; then
+    fork_die "$frk_label is missing; regenerate the release key pair (nothing was changed)"
+  fi
+  if [ -L "$frk_path" ] || [ ! -f "$frk_path" ]; then
+    fork_die "$frk_label is not a regular file: $frk_path"
+  fi
+  frk_owner=$(stat -c %u -- "$frk_path") || fork_die "cannot read ownership of $frk_path" # portability: VPS-only fork tooling (Linux, systemd user unit)
+  frk_mode=$(stat -c %a -- "$frk_path") || fork_die "cannot read mode of $frk_path" # portability: VPS-only fork tooling (Linux, systemd user unit)
+  frk_me=$(id -u) # portability: VPS-only fork tooling (Linux, systemd user unit)
+  if [ "$frk_owner" != "$frk_me" ]; then
+    fork_die "$frk_label $frk_path is owned by uid $frk_owner, not $frk_me; regenerate it (the existing file was not changed)"
+  fi
+  frk_ok=0
+  for frk_one in "$@"; do
+    if [ "$frk_mode" = "$frk_one" ]; then
+      frk_ok=1
+    fi
+  done
+  if [ "$frk_ok" -ne 1 ]; then
+    fork_die "$frk_label $frk_path is mode $frk_mode, expected $frk_expected; regenerate it (the existing file was not changed)"
+  fi
+}
+
+# Backup directory name. The UTC time alone collides when two applies start
+# in the same second; the pid of this process does not.
+fork_backup_stamp() {
+  printf '%s-%s\n' "$(date -u +%Y%m%dT%H%M%SZ)" "$$"
+}
+
+# Exclusive lock for one home, shared by install.sh --apply and
+# rollback.sh --apply. The file is next to the data home, never inside it,
+# so a custom backup root still serialises the same home. fd 9 stays open
+# until this process exits, which includes the EXIT trap. A second launch
+# is refused at once.
+fork_acquire_apply_lock() {
+  fal_home=$(fork_canonical_path "$(fork_home)")
+  fal_parent=$(dirname -- "$fal_home")
+  fal_dir=$(fork_prepare_private_dir "$fal_parent/timon-fork-locks" "apply lock directory" create)
+  fal_name=$(fork_unit_name).lock
+  fal_file=$(fork_confine_file "$fal_dir/$fal_name" "$fal_dir" "apply lock") || exit 1
+  if [ ! -e "$fal_file" ] && [ ! -L "$fal_file" ]; then
+    fal_tmp=$(mktemp "$fal_dir/apply-lock.XXXXXX") || fork_die "cannot create the apply lock" # portability: VPS-only fork tooling (Linux, systemd user unit)
+    chmod 0600 -- "$fal_tmp" || { # portability: VPS-only fork tooling (Linux, systemd user unit)
+      rm -f -- "$fal_tmp"
+      fork_die "cannot restrict the apply lock"
+    }
+    fal_mode=$(stat -c %a -- "$fal_tmp") || fal_mode= # portability: VPS-only fork tooling (Linux, systemd user unit)
+    if [ "$fal_mode" != "600" ]; then
+      rm -f -- "$fal_tmp"
+      fork_die "apply lock temporary is mode ${fal_mode:-unknown}, expected 600"
+    fi
+    if [ -L "$fal_file" ]; then
+      rm -f -- "$fal_tmp"
+      fork_die "refusing to follow symlink $fal_file"
+    fi
+    if [ -e "$fal_file" ]; then
+      rm -f -- "$fal_tmp"
+    elif ! mv -T -n -- "$fal_tmp" "$fal_file"; then
+      rm -f -- "$fal_tmp"
+      fork_die "cannot install the apply lock"
+    fi
+  fi
+  fal_file=$(fork_confine_file "$fal_dir/$fal_name" "$fal_dir" "apply lock") || exit 1
+  if [ -L "$fal_file" ] || [ ! -f "$fal_file" ]; then
+    fork_die "apply lock is not a regular file: $fal_file"
+  fi
+  fal_owner=$(stat -c %u -- "$fal_file") || fork_die "cannot read ownership of the apply lock" # portability: VPS-only fork tooling (Linux, systemd user unit)
+  fal_mode=$(stat -c %a -- "$fal_file") || fork_die "cannot read mode of the apply lock" # portability: VPS-only fork tooling (Linux, systemd user unit)
+  fal_me=$(id -u) # portability: VPS-only fork tooling (Linux, systemd user unit)
+  if [ "$fal_owner" != "$fal_me" ]; then
+    fork_die "apply lock $fal_file is owned by uid $fal_owner, not $fal_me (not changing it)"
+  fi
+  if [ "$fal_mode" != "600" ]; then
+    fork_die "apply lock $fal_file is mode $fal_mode, expected 600 (not changing it)"
+  fi
+  # Same open file for the rest of this process, trap included.
+  exec 9<>"$fal_file" || fork_die "cannot open the apply lock"
+  if ! flock -n 9; then # portability: VPS-only fork tooling (Linux, systemd user unit)
+    fork_die "another install or rollback is already applying changes to this home (not waiting)"
   fi
 }
 

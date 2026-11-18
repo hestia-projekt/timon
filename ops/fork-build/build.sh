@@ -103,7 +103,15 @@ for planted in "$KEYS" "$PREP/stage" "$PREP/out"; do
     fork_die "refusing to follow symlink $planted"
   fi
 done
-mkdir -p -- "$KEYS" "$PREP/stage" "$PREP/out"
+mkdir -p -- "$(dirname -- "$KEYS")" "$PREP/stage" "$PREP/out"
+if [ -L "$KEYS" ]; then
+  fork_die "refusing to follow symlink $KEYS"
+fi
+# A new key directory is private. An existing one is not chmodded:
+# fork_ensure_release_keys refuses it unless it is already mode 0700.
+if [ ! -d "$KEYS" ]; then
+  mkdir -m 0700 -- "$KEYS" || fork_die "cannot create the release key directory"
+fi
 KEYS=$(fork_confine "$keys_want" "$PREP" "keys") || exit 1
 [ "$KEYS" = "$keys_want" ] || fork_die "keys leave the preparation root ($KEYS)"
 fork_ensure_release_keys "$KEYS" || exit 1

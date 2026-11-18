@@ -45,6 +45,12 @@ ACTIVE=$(tr -d '[:space:]' < "$HOME_DIR/desktop-runtime/active-release")
 fork_version_id_ok "$ACTIVE"
 TARGET="$HOME_DIR/desktop-runtime/releases/$VERSION_ID"
 
+# Held until this process exits, so the mission checks, the file swap and
+# the EXIT trap cannot overlap another apply or rollback on this home.
+if [ "$APPLY" -eq 1 ]; then
+  fork_acquire_apply_lock
+fi
+
 printf 'unit %s\n' "$UNIT_NAME"
 printf 'port %s\n' "$PORT"
 printf 'active %s\n' "$ACTIVE"
@@ -122,7 +128,7 @@ fork_assert_idle "$HOME_DIR" "$PORT" "$SCRIPT"
 phase=stopped
 systemctl --user stop "$UNIT_NAME" # portability: VPS-only fork tooling (Linux, systemd user unit)
 
-STAMP=$(date -u +%Y%m%dT%H%M%SZ)
+STAMP=$(fork_backup_stamp)
 DEST="$BACKUP_ROOT/$STAMP"
 if [ -e "$DEST" ] || [ -L "$DEST" ]; then
   fork_die "backup already exists: $DEST"

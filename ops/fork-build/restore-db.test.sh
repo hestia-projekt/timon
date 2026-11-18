@@ -9,7 +9,20 @@ ROOT=$(cd -- "$(dirname -- "$SCRIPT")" && pwd)
 . "$ROOT/lib.sh"
 
 ROOT_TMP=$(mktemp -d /tmp/fork-restore-db.XXXXXX)
-trap 'rm -rf -- "$ROOT_TMP"' EXIT
+hang_pid=
+lock_pid=
+cleanup_test() {
+  if [ -n "$hang_pid" ]; then
+    kill "$hang_pid" 2>/dev/null || true
+    wait "$hang_pid" 2>/dev/null || true
+  fi
+  if [ -n "$lock_pid" ]; then
+    kill -- "-$lock_pid" 2>/dev/null || true
+    wait "$lock_pid" 2>/dev/null || true
+  fi
+  rm -rf -- "$ROOT_TMP"
+}
+trap cleanup_test EXIT
 
 case "$ROOT_TMP" in
   /tmp/*) ;;
@@ -867,6 +880,53 @@ pub_inode=$(stat -c %i -- "$key_ok/fork-release.pub.pem")
 run_ok fork_ensure_release_keys "$key_ok"
 assert_eq "$(stat -c %i -- "$key_ok/fork-release.key.pem")" "$priv_inode" "private key reused"
 assert_eq "$(stat -c %i -- "$key_ok/fork-release.pub.pem")" "$pub_inode" "public key reused"
+
+# A copied private key with group or other read bits is refused and left
+# unchanged. The operator regenerates it; the script does not chmod it.
+chmod 0644 "$key_ok/fork-release.key.pem"
+expect_die fork_ensure_release_keys "$key_ok"
+assert_err "regenerate"
+assert_err "was not changed"
+assert_eq "$(stat -c %a -- "$key_ok/fork-release.key.pem")" "644" "loose private key unchanged"
+assert_eq "$(stat -c %i -- "$key_ok/fork-release.key.pem")" "$priv_inode" "loose private key inode"
+assert_eq "$(stat -c %i -- "$key_ok/fork-release.pub.pem")" "$pub_inode" "public key inode while private key is loose"
+chmod 0600 "$key_ok/fork-release.key.pem"
+run_ok fork_ensure_release_keys "$key_ok"
+assert_eq "$(stat -c %a -- "$key_ok/fork-release.key.pem")" "600" "private key still 600"
+assert_eq "$(stat -c %i -- "$key_ok/fork-release.key.pem")" "$priv_inode" "private key 600 reused"
+assert_eq "$(stat -c %i -- "$key_ok/fork-release.pub.pem")" "$pub_inode" "public key kept with private key"
+
+# A public key may be 0644. It is not rewritten to 0600.
+chmod 0644 "$key_ok/fork-release.pub.pem"
+run_ok fork_ensure_release_keys "$key_ok"
+assert_eq "$(stat -c %a -- "$key_ok/fork-release.pub.pem")" "644" "public key 644 kept"
+assert_eq "$(stat -c %i -- "$key_ok/fork-release.pub.pem")" "$pub_inode" "public key 644 reused"
+assert_eq "$(stat -c %i -- "$key_ok/fork-release.key.pem")" "$priv_inode" "private key kept with public key 644"
+chmod 0666 "$key_ok/fork-release.pub.pem"
+expect_die fork_ensure_release_keys "$key_ok"
+assert_err "regenerate"
+assert_eq "$(stat -c %a -- "$key_ok/fork-release.pub.pem")" "666" "loose public key unchanged"
+chmod 0600 "$key_ok/fork-release.pub.pem"
+
+# The key directory is not chmodded either. A traversable directory is refused.
+chmod 0755 "$key_ok"
+expect_die fork_ensure_release_keys "$key_ok"
+assert_err "expected 700"
+assert_err "not changing it"
+assert_eq "$(stat -c %a -- "$key_ok")" "755" "key directory unchanged"
+assert_eq "$(stat -c %a -- "$key_ok/fork-release.key.pem")" "600" "private key not chmodded with the directory"
+chmod 0700 "$key_ok"
+
+key_open=$ROOT_TMP/keys-open-mode
+mkdir -m 0755 "$key_open"
+expect_die fork_ensure_release_keys "$key_open"
+assert_err "expected 700"
+assert_eq "$(stat -c %a -- "$key_open")" "755" "empty key directory unchanged"
+if [ -e "$key_open/fork-release.key.pem" ] || [ -e "$key_open/fork-release.pub.pem" ]; then
+  printf 'FAIL keys were written into a directory that is not mode 700\n' >&2
+  exit 1
+fi
+
 mv -- "$key_ok/fork-release.pub.pem" "$key_ok/pub.real"
 ln -s "$ROOT_TMP/key-victim" "$key_ok/fork-release.pub.pem"
 expect_die fork_ensure_release_keys "$key_ok"
@@ -1046,6 +1106,206 @@ exit 99
 EOF
 chmod 755 "$ROOT_TMP/bin/systemctl"
 : > "$FORK_TEST_SYSTEMCTL_LOG"
+
+# Two processes in the same second must not share a backup directory name.
+sh -c '. "$1"; fork_backup_stamp' sh "$ROOT/lib.sh" > "$ROOT_TMP/stamp1" &
+stamp_pid1=$!
+sh -c '. "$1"; fork_backup_stamp' sh "$ROOT/lib.sh" > "$ROOT_TMP/stamp2" &
+stamp_pid2=$!
+wait "$stamp_pid1"
+wait "$stamp_pid2"
+stamp1=$(cat "$ROOT_TMP/stamp1")
+stamp2=$(cat "$ROOT_TMP/stamp2")
+if [ -z "$stamp1" ] || [ "$stamp1" = "$stamp2" ]; then
+  printf 'FAIL backup stamps are not unique: [%s] [%s]\n' "$stamp1" "$stamp2" >&2
+  exit 1
+fi
+case "$stamp1" in
+  [0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]T[0-9][0-9][0-9][0-9][0-9][0-9]Z-[0-9]*) ;;
+  *)
+    printf 'FAIL backup stamp has no pid suffix: %s\n' "$stamp1" >&2
+    exit 1
+    ;;
+esac
+
+# A lock file left world-readable is refused. It is not chmodded.
+loose_home=$ROOT_TMP/loose-home
+mkdir -m 0700 -- "$loose_home"
+saved_data_home=$TIMON_FORK_DATA_HOME
+TIMON_FORK_DATA_HOME=$loose_home
+loose_unit=$(fork_unit_name)
+TIMON_FORK_DATA_HOME=$saved_data_home
+loose_dir=$(dirname -- "$(realpath -m -- "$loose_home")")/timon-fork-locks
+if [ ! -d "$loose_dir" ]; then
+  mkdir -m 0700 -- "$loose_dir"
+fi
+printf 'x\n' > "$loose_dir/$loose_unit.lock"
+chmod 0644 "$loose_dir/$loose_unit.lock"
+TIMON_FORK_DATA_HOME=$loose_home
+expect_die fork_acquire_apply_lock
+TIMON_FORK_DATA_HOME=$saved_data_home
+assert_err "expected 600"
+assert_err "not changing it"
+assert_eq "$(stat -c %a -- "$loose_dir/$loose_unit.lock")" "644" "loose apply lock unchanged"
+
+# Two applies on one disposable home. The first blocks in the mission check.
+# The second, and a rollback, are refused at once. systemctl is the fake above.
+if ! command -v flock >/dev/null 2>&1 || ! command -v setsid >/dev/null 2>&1 || ! command -v stdbuf >/dev/null 2>&1; then
+  printf 'FAIL flock, setsid or stdbuf is missing\n' >&2
+  exit 1
+fi
+lock_home=$ROOT_TMP/lock-home
+lock_user=$ROOT_TMP/lock-user
+lock_backup=$ROOT_TMP/lock-backups
+lock_pkg=$ROOT_TMP/lock-pkg
+mkdir -m 0700 -- "$lock_home" "$lock_user" "$lock_backup"
+mkdir -p -- "$lock_home/desktop-runtime" "$lock_pkg/resources/orchestrator" "$lock_user/.config/systemd/user"
+printf '%s\n' '0.1.8-test' > "$lock_home/desktop-runtime/active-release"
+printf 'token\n' > "$lock_home/daemon-token"
+printf '%s\n' '{"versionId":"0.1.8-fork.testlock"}' > "$lock_pkg/fork-build.json"
+TIMON_FORK_DATA_HOME=$lock_home
+lock_unit=$(fork_unit_name)
+TIMON_FORK_DATA_HOME=$saved_data_home
+cat > "$ROOT_TMP/hang-server.mjs" << 'EOF'
+import { createServer } from 'node:http';
+import { writeFileSync } from 'node:fs';
+const file = process.argv[2];
+const server = createServer(() => {});
+server.listen(0, '127.0.0.1', () => {
+  writeFileSync(file, String(server.address().port));
+});
+EOF
+node "$ROOT_TMP/hang-server.mjs" "$ROOT_TMP/hang-port" &
+hang_pid=$!
+hang_i=0
+while [ ! -s "$ROOT_TMP/hang-port" ]; do
+  hang_i=$((hang_i + 1))
+  if [ "$hang_i" -gt 50 ] || ! kill -0 "$hang_pid" 2>/dev/null; then
+    printf 'FAIL hang server did not listen\n' >&2
+    exit 1
+  fi
+  sleep 0.1
+done
+hang_port=$(cat "$ROOT_TMP/hang-port")
+printf 'Environment="PORT=%s"\n' "$hang_port" > "$lock_user/.config/systemd/user/${lock_unit}.service"
+lock_dir=$(dirname -- "$(realpath -m -- "$lock_home")")/timon-fork-locks
+lock_file=$lock_dir/$lock_unit.lock
+case "$lock_dir" in
+  "$lock_home"|"$lock_home"/*|"$HOME/.timon"|"$HOME/.timon"/*)
+    printf 'FAIL apply lock directory is inside a Timon home\n' >&2
+    exit 1
+    ;;
+esac
+setsid stdbuf -oL -eL env \
+  HOME="$lock_user" \
+  TIMON_HOME="$lock_home" \
+  TIMON_FORK_DATA_HOME="$lock_home" \
+  TIMON_FORK_BACKUP_ROOT="$lock_backup" \
+  "$ROOT/install.sh" --package "$lock_pkg" --backup-root "$lock_backup" --apply \
+  > "$ROOT_TMP/lock-a.out" 2> "$ROOT_TMP/lock-a.err" &
+lock_pid=$!
+lock_seen=0
+lock_i=0
+while [ "$lock_i" -lt 100 ]; do
+  if [ -f "$ROOT_TMP/lock-a.out" ] && grep -F -q -- "unit " "$ROOT_TMP/lock-a.out"; then
+    lock_seen=1
+    break
+  fi
+  # stdout may stay buffered. A live process and its lock file means the
+  # exclusive lock was taken: a failed flock exits.
+  if [ -f "$lock_file" ] && kill -0 "$lock_pid" 2>/dev/null; then
+    sleep 0.2
+    if kill -0 "$lock_pid" 2>/dev/null; then
+      lock_seen=1
+      break
+    fi
+  fi
+  if ! kill -0 "$lock_pid" 2>/dev/null; then
+    break
+  fi
+  lock_i=$((lock_i + 1))
+  sleep 0.1
+done
+if [ "$lock_seen" -ne 1 ]; then
+  printf 'FAIL first apply did not take the lock\n' >&2
+  cat "$ROOT_TMP/lock-a.out" >&2
+  cat "$ROOT_TMP/lock-a.err" >&2
+  exit 1
+fi
+assert_eq "$(stat -c %a -- "$lock_dir")" "700" "apply lock directory mode"
+assert_eq "$(stat -c %a -- "$lock_file")" "600" "apply lock mode"
+start_s=$(date +%s)
+set +e
+env \
+  HOME="$lock_user" \
+  TIMON_HOME="$lock_home" \
+  TIMON_FORK_DATA_HOME="$lock_home" \
+  TIMON_FORK_BACKUP_ROOT="$lock_backup" \
+  "$ROOT/install.sh" --package "$lock_pkg" --backup-root "$lock_backup" --apply \
+  > "$ROOT_TMP/lock-b.out" 2> "$ROOT_TMP/lock-b.err"
+lock_b_status=$?
+set -e
+end_s=$(date +%s)
+elapsed=$((end_s - start_s))
+if [ "$lock_b_status" -eq 0 ]; then
+  printf 'FAIL second apply was not refused\n' >&2
+  cat "$ROOT_TMP/lock-b.out" >&2
+  cat "$ROOT_TMP/lock-b.err" >&2
+  exit 1
+fi
+if [ "$elapsed" -ge 8 ]; then
+  printf 'FAIL second apply waited %s seconds\n' "$elapsed" >&2
+  cat "$ROOT_TMP/lock-b.err" >&2
+  exit 1
+fi
+if ! grep -F -q -- "already applying" "$ROOT_TMP/lock-b.err" || ! grep -F -q -- "not waiting" "$ROOT_TMP/lock-b.err"; then
+  printf 'FAIL second apply was not refused for the lock\n' >&2
+  cat "$ROOT_TMP/lock-b.out" >&2
+  cat "$ROOT_TMP/lock-b.err" >&2
+  exit 1
+fi
+if grep -F -q -- "mission list" "$ROOT_TMP/lock-b.err"; then
+  printf 'FAIL second apply reached the mission check\n' >&2
+  cat "$ROOT_TMP/lock-b.err" >&2
+  exit 1
+fi
+lock_rb=$ROOT_TMP/lock-rb
+mkdir -m 0700 -- "$lock_rb"
+jq -n --arg unit "$lock_unit" '{unit: $unit, port: "9", activeRelease: "0.1.8-test"}' > "$lock_rb/manifest.json"
+start_s=$(date +%s)
+set +e
+env \
+  HOME="$lock_user" \
+  TIMON_HOME="$lock_home" \
+  TIMON_FORK_DATA_HOME="$lock_home" \
+  "$ROOT/rollback.sh" --backup "$lock_rb" --apply \
+  > "$ROOT_TMP/lock-c.out" 2> "$ROOT_TMP/lock-c.err"
+lock_c_status=$?
+set -e
+end_s=$(date +%s)
+elapsed=$((end_s - start_s))
+if [ "$lock_c_status" -eq 0 ] || [ "$elapsed" -ge 8 ]; then
+  printf 'FAIL rollback apply was not refused at once (status %s, %s seconds)\n' "$lock_c_status" "$elapsed" >&2
+  cat "$ROOT_TMP/lock-c.out" >&2
+  cat "$ROOT_TMP/lock-c.err" >&2
+  exit 1
+fi
+if ! grep -F -q -- "already applying" "$ROOT_TMP/lock-c.err" || ! grep -F -q -- "not waiting" "$ROOT_TMP/lock-c.err"; then
+  printf 'FAIL rollback apply was not refused for the lock\n' >&2
+  cat "$ROOT_TMP/lock-c.err" >&2
+  exit 1
+fi
+if [ -s "$FORK_TEST_SYSTEMCTL_LOG" ]; then
+  printf 'FAIL systemctl ran during the lock test\n' >&2
+  cat "$FORK_TEST_SYSTEMCTL_LOG" >&2
+  exit 1
+fi
+kill -- "-$lock_pid" 2>/dev/null || kill "$lock_pid" 2>/dev/null || true
+wait "$lock_pid" 2>/dev/null || true
+lock_pid=
+kill "$hang_pid" 2>/dev/null || true
+wait "$hang_pid" 2>/dev/null || true
+hang_pid=
 
 if [ -s "$FORK_TEST_SYSTEMCTL_LOG" ]; then
   printf 'FAIL systemctl was called\n' >&2

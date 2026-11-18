@@ -58,13 +58,15 @@ ops/fork-build/install.sh --package ~/timon-fork-prep/out/<id>
 ops/fork-build/install.sh --package ~/timon-fork-prep/out/<id> --apply
 ```
 
+Avec `--apply`, `install.sh` et `rollback.sh` prennent d'abord le même verrou exclusif pour ce home, avant de relire les missions. Le fichier est `<répertoire parent du home>/timon-fork-locks/<unité>.lock` : à côté de `~/.timon` (donc `~/timon-fork-locks/`), jamais dedans. Le répertoire est `0700`, le fichier `0600`. Un second `--apply`, installation ou retour arrière, est refusé tout de suite : il n'attend pas. Le descripteur reste ouvert jusqu'à la fin du processus, donc pendant le `trap` qui relance l'unité.
+
 Avec `--apply`, dans l'ordre :
 
 1. Il refuse si `GET /api/missions?status=running` n'est pas vide, ou s'il ne peut pas le lire. Le jeton du démon est lu dans le fichier, jamais affiché. Une page pleine (1000 lignes) est aussi un refus : la liste serait tronquée. Sans `--apply`, le script s'arrête ici.
 2. Il prépare le dossier racine de sauvegarde, hors de `~/.timon`. Le chemin (`--backup-root` ou `TIMON_FORK_BACKUP_ROOT`) est canonique. `~/.timon` lui-même est refusé. S'il n'existe pas, le script le crée en `0700` ; les parents déjà présents ne sont pas modifiés. S'il existe, le script ne change pas ses droits : il l'accepte seulement s'il appartient à l'utilisateur courant et est déjà en `0700`, sinon il s'arrête.
 3. Il relit la liste des missions, et c'est la dernière action avant l'arrêt. Une mission apparue depuis le premier contrôle, ou une liste illisible, est un refus : l'unité en marche n'est pas arrêtée.
 4. Il arrête l'unité. La copie qui suit ne bouge plus. Si une étape échoue avant la bascule, l'unité précédente est relancée. Après la bascule, un échec déclenche le retour arrière.
-5. Il écrit une sauvegarde horodatée dans `~/timon-fork-backups/<date>/` (ou sous `TIMON_FORK_BACKUP_ROOT`). Ce sous-dossier est créé en `0700` par le script. La racine, si elle existait déjà, garde ses droits. Les fichiers sont en `0600` ; un exécutable copié reste exécutable par le propriétaire seul (`0700`), pour que le retour arrière puisse lancer le binaire. Le script vérifie ces droits après la copie :
+5. Il écrit une sauvegarde dans `~/timon-fork-backups/<date UTC>-<pid>/` (ou sous `TIMON_FORK_BACKUP_ROOT`). Le pid évite qu'une seconde bascule dans la même seconde prenne le même dossier. Ce sous-dossier est créé en `0700` par le script. La racine, si elle existait déjà, garde ses droits. Les fichiers sont en `0600` ; un exécutable copié reste exécutable par le propriétaire seul (`0700`), pour que le retour arrière puisse lancer le binaire. Le script vérifie ces droits après la copie :
    - `timon.db` et `integrations.db` par `sqlite3 .backup`, puis `PRAGMA integrity_check` ;
    - le reste du dossier, sauf le runtime, les worktrees, les caches et les bases (une copie à chaud du fichier SQLite n'est pas utilisée) ; un second `rsync` à blanc doit être vide ;
    - une copie de la release officielle courante, vérifiée par le SHA-256 de `release-manifest.json` et le nombre de fichiers ;
@@ -96,8 +98,8 @@ Avant `--apply`, sur cette machine :
 ## Retour arrière
 
 ```bash
-ops/fork-build/rollback.sh --backup ~/timon-fork-backups/<date>
-ops/fork-build/rollback.sh --backup ~/timon-fork-backups/<date> --apply
+ops/fork-build/rollback.sh --backup ~/timon-fork-backups/<date>-<pid>
+ops/fork-build/rollback.sh --backup ~/timon-fork-backups/<date>-<pid> --apply
 ```
 
 `--backup` est canonique. Le dossier est refusé s'il est `~/.timon`, s'il s'y trouve, s'il n'appartient pas à l'utilisateur courant, ou s'il n'est pas déjà en `0700`. Le script ne change pas ses droits.

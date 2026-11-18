@@ -30,6 +30,12 @@ done
 BACKUP=$(fork_prepare_private_dir "$BACKUP" "backup" existing)
 [ -f "$BACKUP/manifest.json" ] || fork_die "no manifest in $BACKUP"
 
+# Same lock as install.sh --apply, taken before the mission check and held
+# through the EXIT trap. A second apply is refused instead of waiting.
+if [ "$APPLY" -eq 1 ]; then
+  fork_acquire_apply_lock
+fi
+
 UNIT_FILE=$(fork_unit_file)
 UNIT_NAME=$(fork_unit_name)
 UNIT_HOME=$(fork_unit_home "$UNIT_FILE")
